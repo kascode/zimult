@@ -103,7 +103,7 @@ td.bobB{animation:bobB .28s ease-in-out infinite alternate}
 td.bobA,td.bobB{background:var(--hl);color:#1d2430;z-index:2}
 .pts.flick{color:var(--hl-strong)}
 @media (prefers-reduced-motion:reduce){td.bobA,td.bobB{animation:none}#o67.show{animation:none;opacity:1}}
-#mute,#skinBtn{padding:4px 10px;font-size:12px;align-self:flex-start}
+#mute,#skinBtn,#vrBtn{padding:4px 10px;font-size:12px;align-self:flex-start}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-right:6px;vertical-align:middle}.dot.on{background:var(--good)}
 
 /* ----- lobby ----- */
@@ -280,7 +280,7 @@ body.glitching .board{animation:glitch 2s steps(12)}
       <h1>ZIMULT</h1>
       <p class="sub" id="sub">Roll the grid, answer, claim the cell. First to 10 wins.</p>
     </div>
-    <div class="skin"><button class="ghost" id="skinBtn" type="button">Skin</button><button class="ghost" id="mute" type="button" aria-label="Toggle sound">Sound on</button></div>
+    <div class="skin"><button class="ghost" id="skinBtn" type="button">Skin</button><button class="ghost" id="mute" type="button" aria-label="Toggle sound">Sound on</button><button class="ghost" id="vrBtn" type="button" hidden>VR</button></div>
     <div class="code" id="codebox" hidden>
       <span><span class="dot" id="dot"></span>Room <code id="code"></code></span>
       <button class="ghost" id="copy" type="button">Copy link</button>
@@ -306,6 +306,15 @@ body.glitching .board{animation:glitch 2s steps(12)}
         <li><button id="soloBtn" type="button">Vs the machine</button></li>
         <li class="sub-row"><span class="lvl" id="lvl"><button type="button" class="opt" data-lvl="0">Easy</button><button type="button" class="opt" data-lvl="1">Normal</button><button type="button" class="opt" data-lvl="2">Hard</button></span></li>
         <li><button id="streakBtn" type="button">Perfect ten</button><span class="hint">10 in a row. One miss, back to 0.</span></li>
+      </ul>
+    </div>
+    <div class="sec" id="vrSec" hidden>
+      <h3 class="sec-h">Play in VR</h3>
+      <ul class="menu">
+        <li><button id="vrSoloBtn" type="button">VR vs the machine</button><span class="hint">Uses the difficulty above</span></li>
+        <li><button id="vrStreakBtn" type="button">VR perfect ten</button></li>
+        <li><button id="vrHostBtn" type="button">VR with a friend</button><span class="hint">Starts a game and gives you a code</span></li>
+        <li><button id="vrJoinBtn" type="button">VR join</button><span class="hint">Uses the code typed above</span></li>
       </ul>
     </div>
     <div class="opts">
@@ -526,8 +535,8 @@ function slotColors(slot){ const cs = getComputedStyle(document.documentElement)
 function mulberry(seed){ let a = seed>>>0; return () => { a = (a + 0x6D2B79F5)>>>0; let t = a; t = Math.imul(t ^ (t>>>15), t | 1); t ^= t + Math.imul(t ^ (t>>>7), t | 61); return ((t ^ (t>>>14))>>>0) / 4294967296; }; }
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 let animToken = 0;
-function roll(target, seed) {
-  const token = ++animToken, rnd = mulberry(seed);
+function rollSteps(target, seed) {
+  const rnd = mulberry(seed);
   const rowSteps = 18, colSteps = 26, steps = [];
   for (let i = 0; i < colSteps; i++) {
     const last = i === colSteps - 1;
@@ -535,6 +544,10 @@ function roll(target, seed) {
     const c = last ? target.c : 1 + Math.floor(rnd()*N);
     steps.push({ r, c, wait: 45 + 300 * Math.pow(i / colSteps, 2.4) });
   }
+  return steps;
+}
+function roll(target, seed) {
+  const token = ++animToken, steps = rollSteps(target, seed);
   if (reduced) { clearHl(); hlRow(target.r); hlCol(target.c); return Promise.resolve(); }
   return new Promise(res => {
     let i = 0;
@@ -654,6 +667,19 @@ function dispatch(action) {
   if (mode === 'guest') { if (conn && conn.open) conn.send({ type:'action', action }); return; }
   apply(action);
 }
+// ---------- external renderer bridge (VR) ----------
+const stateListeners = new Set();
+let poseListener = null;
+window.ZIMULT = Object.freeze({
+  get state(){ return S; },
+  get mode(){ return mode; },
+  get mySlot(){ return mySlotIdx; },
+  canAct, dispatch, name, mulberry, sfx, GOAL, N,
+  onState(fn){ stateListeners.add(fn); if (S) fn(S); return () => stateListeners.delete(fn); },
+  sendPose(p){ if ((mode === 'host' || mode === 'guest') && conn && conn.open) conn.send({ type:'pose', p }); },
+  onPose(fn){ poseListener = fn; },
+  rollSteps, enterVR,
+});
 function broadcast() { if (mode === 'host' && conn && conn.open) conn.send({ type:'state', state: S }); }
 
 // ---------- render ----------
@@ -710,6 +736,7 @@ function toast(a){
 
 async function render() {
   if (!S || animating) return;
+  for (const fn of stateListeners) { try { fn(S); } catch (e) { console.error(e); } }   // a renderer bug must not stop the 2D game
   cpuTick();
   if (S.n === 0 && S.ach.length === 0) achShown.clear();
   if (S.n === 0) { whistleShown = 0; glitchShown = 0; }
@@ -837,6 +864,7 @@ function startHost(){
     c.on('data', m => {
       if (m.type === 'hello') { S.names[1] = (m.name || 'Player 2').slice(0,14); S.seats[1] = true; broadcast(); render(); }
       else if (m.type === 'action') apply(m.action);
+      else if (m.type === 'pose') poseListener && poseListener(m.p);
     });
     c.on('close', () => { online(false); conn = null; S.seats[1] = false; setMsg('Other player disconnected. Waiting for them to rejoin…', 'bad'); render(); });
   });
@@ -854,6 +882,7 @@ function startJoin(code){
     conn.on('data', m => {
       if (m.type === 'state') { S = m.state; render(); }
       else if (m.type === 'full') { lmsg.textContent = 'That room already has two players.'; lmsg.className='msg bad'; }
+      else if (m.type === 'pose') poseListener && poseListener(m.p);
     });
     conn.on('close', () => { online(false); setMsg('Lost the host. Reload to rejoin.', 'bad'); });
   });
@@ -865,6 +894,30 @@ $('joinCode').onkeydown = e => { if (e.key === 'Enter') startJoin($('joinCode').
 $('localBtn').onclick = startLocal;
 $('soloBtn').onclick = startSolo;
 $('streakBtn').onclick = startStreak;
+// ---------- VR entry: the menu section and header button appear only with WebXR immersive-vr (or #vrdesk for desktop tests) ----------
+async function enterVR(){
+  const desk = location.hash === '#vrdesk';
+  let session = null;
+  try {
+    // requestSession runs first, synchronously inside the click's user activation; the vr.js + three.js download can outlast it
+    if (!desk) {
+      if (!navigator.xr) throw new Error('WebXR is not available in this browser.');
+      session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] });
+    }
+    const m = await import('./vr.js'); await m.start(window.ZIMULT, { session, desk });
+  } catch (e) {
+    if (session) session.end().catch(() => {});
+    const t = 'VR could not start: ' + (e && e.message || e); if (!$('lobby').hidden) { lmsg.textContent = t; lmsg.className = 'msg bad'; } else setMsg(t, 'bad');
+  }
+}
+async function vrSupported(){ try { return !!(navigator.xr && await navigator.xr.isSessionSupported('immersive-vr')); } catch (_) { return false; } }
+const showVR = () => { $('vrSec').hidden = false; $('vrBtn').hidden = false; };
+if (location.hash === '#vrdesk') showVR(); else vrSupported().then(ok => { if (ok) showVR(); });
+$('vrSoloBtn').onclick = () => { startSolo(); enterVR(); };
+$('vrStreakBtn').onclick = () => { startStreak(); enterVR(); };
+$('vrHostBtn').onclick = () => { startHost(); enterVR(); };
+$('vrJoinBtn').onclick = () => { startJoin($('joinCode').value); if (mode === 'guest') enterVR(); };
+$('vrBtn').onclick = enterVR;
 try { const saved = localStorage.getItem('ttd-nick'); if (saved) $('nick').value = saved; } catch (_) {}
 $('nick').onchange = () => { try { localStorage.setItem('ttd-nick', nick()); } catch (_) {} };
 const h = (location.hash || '').slice(1);
