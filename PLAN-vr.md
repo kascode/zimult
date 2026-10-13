@@ -38,8 +38,23 @@ let poseListener = null;
 - Extract the step list builder out of `roll()` into `function rollSteps(target, seed)` (returns `steps`), make `roll()` call it, and expose it as above. Both views then share one timing table.
 - At the top of `render()`, right after the `if (!S || animating) return;` guard, add: `for (const fn of stateListeners) fn(S);`. (Listeners get every state, including ones the 2D view is still animating; the VR view has its own guards.)
 - In `startHost`'s `c.on('data', ...)` add: `else if (m.type === 'pose') poseListener && poseListener(m.p);`. Same line in `startJoin`'s `conn.on('data', ...)`.
-- Lobby: in the "Play together" section add `<li id="vrRow" hidden><button id="vrBtn" type="button">Enter VR</button><span class="hint">Quest or PC VR headset</span></li>`. On load: `if (navigator.xr) navigator.xr.isSessionSupported('immersive-vr').then(ok => { $('vrRow').hidden = !ok; }).catch(() => {});`. The button is **also** needed once a game is running (the player picks a mode first, then enters VR): add `<button class="ghost" id="vrBtn2" type="button" hidden>VR</button>` in the header `.skin` group next to `#mute`, shown under the same condition.
-- Both buttons call `enterVR()`: `const m = await import('./vr.js'); m.start(window.ZIMULT);` wrapped in try/catch; on failure show the error in `#lmsg` / `setMsg(..., 'bad')`. If the lobby is still open when `vrBtn` is pressed, start **solo** mode first (`startSolo()`), because VR needs a running game; say so in the hint text ("Starts a solo game").
+- Lobby: VR is a **mode in the menu**, not a side button. Add a third section after "Play alone":
+
+  ```html
+  <div class="sec" id="vrSec" hidden>
+    <h3 class="sec-h">Play in VR</h3>
+    <ul class="menu">
+      <li><button id="vrSoloBtn" type="button">VR vs the machine</button><span class="hint">Uses the difficulty above</span></li>
+      <li><button id="vrStreakBtn" type="button">VR perfect ten</button></li>
+      <li><button id="vrHostBtn" type="button">VR with a friend</button><span class="hint">Starts a game and gives you a code</span></li>
+      <li><button id="vrJoinBtn" type="button">VR join</button><span class="hint">Uses the code typed above</span></li>
+    </ul>
+  </div>
+  ```
+
+  The whole section stays `hidden` unless `navigator.xr && await navigator.xr.isSessionSupported('immersive-vr')` resolves true, so phones and desktops never see it. Each button starts the matching 2D mode first (`startSolo()`, `startStreak()`, `startHost()`, `startJoin($('joinCode').value)`) and then calls `enterVR()`. For `vrHostBtn` and `vrJoinBtn`, call `enterVR()` immediately after the start function returns (do not wait for the peer to connect): WebXR requires the session request to happen inside the user-activation window of the click, and the connect can take seconds. The VR scene shows the room code and "Waiting for a second player…" on its dialogue panel the same way the 2D view does, because the panel mirrors `#msg`.
+- Header: add `<button class="ghost" id="vrBtn" type="button" hidden>VR</button>` in the `.skin` group next to `#mute`, shown under the same support check, so a game started in 2D can be switched to VR mid-match (and back, via the in-VR EXIT tile). State is shared, so nothing is lost.
+- `enterVR()`: `const m = await import('./vr.js'); await m.start(window.ZIMULT);` wrapped in try/catch; on failure show the error in `#lmsg` (lobby) or `setMsg(..., 'bad')` (in game) and leave the 2D game running.
 - Also expose `window.ZIMULT.enterVR = enterVR` so `vr.js` can show a re-enter button after the session ends.
 
 Nothing else in `index.html` changes. Run the usual syntax check after editing.
@@ -148,7 +163,7 @@ Phase 1: none in VR (page audio continues). Phase 2 (optional): wrap `Z.sfx.tick
 
 ## 10. Order of work (each step ends with `node --check` passing on the extracted `index.html` script and `node --check vr.js` passing)
 
-1. Bridge in `index.html` (section 1) + empty `vr.js` that only logs `start` and ends the session. Verify the lobby button appears only with `navigator.xr`.
+1. Bridge in `index.html` (section 1) + empty `vr.js` that only logs `start` and ends the session. Verify the "Play in VR" section and header button appear only with `navigator.xr` support (fake it in desktop tests by defining `navigator.xr = { isSessionSupported: async () => true, requestSession: async () => { throw new Error('no headset'); } }` before load, via `agent-browser eval` after a reload is not possible, so add a `#vrdesk` hash check that forces the section visible).
 2. Scene (section 3) with a desktop fallback: when `window.location.hash === '#vrdesk'`, skip XR, render to a normal canvas with a fixed camera at (0, 1.6, 0.4) looking at the board, and accept keyboard input. All later steps are developed in this mode first.
 3. `syncScene` (section 4) and roll replay (4.1).
 4. Numpad + FIGHT tile + controller rays (section 5).
@@ -159,7 +174,7 @@ Phase 1: none in VR (page audio continues). Phase 2 (optional): wrap `Z.sfx.tick
 
 ## 11. How to test
 
-- Desktop: `python3 -m http.server 8766 --directory /Users/kascode/Work/zimult` then open `http://localhost:8766/#vrdesk`, pick "Perfect ten" or "Vs the machine", press "VR" in the header. Headless check with `agent-browser` (used throughout this repo): load the page, call `window.ZIMULT.enterVR()` from `eval`, wait 1 s, assert `document.querySelector('canvas[data-zimult-vr]')` exists, no `window.onerror`, and that pressing keys `5`, `6`, `Enter` dispatches an answer (check `window.__S.last`). Screenshot the canvas to eyeball the board.
+- Desktop: `python3 -m http.server 8766 --directory /Users/kascode/Work/zimult` then open `http://localhost:8766/#vrdesk` (the hash forces the "Play in VR" section visible and makes `vr.js` render to a flat canvas instead of requesting an XR session), pick "VR perfect ten" or "VR vs the machine". Headless check with `agent-browser` (used throughout this repo): load the page, call `window.ZIMULT.enterVR()` from `eval`, wait 1 s, assert `document.querySelector('canvas[data-zimult-vr]')` exists, no `window.onerror`, and that pressing keys `5`, `6`, `Enter` dispatches an answer (check `window.__S.last`). Screenshot the canvas to eyeball the board.
 - Roll sync: in desktop mode, start a roll and compare `window.__S.roll` target with the VR target cell's raised state after ~2.5 s.
 - Headset: Quest browser → `https://zimult.equato.fun/` (HTTPS required). Check: button appears, session starts, board at waist height, numpad reachable without leaning, FIGHT → bars sweep → cell rises, answer with controller, claim effect, exit returns to 2D with the same state. Then a P2P match: phone on one side, headset on the other; the heart marker should move with the phone player's... nothing (phones send no pose) — so instead test two headsets or accept the static marker.
 - Performance: Quest browser `chrome://webrtc-internals` is irrelevant; use the in-headset performance overlay (Developer Hub) and keep frame time < 13 ms.
