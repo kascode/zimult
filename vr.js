@@ -320,6 +320,7 @@ function build() {
   msgEl = document.getElementById('msg');
   codeBoxEl = document.getElementById('codebox');
   codeEl = document.getElementById('code');
+  fxBuild();                                          // section 6: shared effect geometry, particle pool
 }
 
 // ---------- syncing the board from S (section 4) ----------
@@ -384,7 +385,7 @@ function syncScene(S) {
     else if (craterLive) { mat = matCrater; sy = 0.5; }
     if (showTarget && k === targetKey) { mat = creeper ? matCreeper : matTarget; sy = 6; }
     const cell = cellMesh[k];
-    cell.material = mat; cell.scale.y = sy;
+    cell.material = mat; if (!scaleLock.has(k)) cell.scale.y = sy;
     if (owner != null) {
       const lb = productLabel(k);
       lb.setText(r * c);
@@ -424,7 +425,7 @@ function syncScene(S) {
   againTile.label.setText(ut() ? 'MERCY' : 'PLAY AGAIN');
   updateDisplay();
 
-  // section 6 hook: claim / miss / 67 / boom / glitch / whistle / win effects, each guarded by its own vr*N variable
+  fxSync(S);                                          // section 6: effects, each guarded by its own vr* variable
   // section 7 hook: opponent marker and solo face (driven by Z.onPose in frame())
   // section 9 hook: seated toggle and EXIT tile (register with addTile)
 }
@@ -472,6 +473,276 @@ function updateHand(s) {
   if (s.pressed) { const f = faceDist(s.pressed, v3); if (!f.inside || f.dz > 0.03) s.pressed = null; }
   else if (best && bf.dz < 0.015) { s.pressed = best; press(best); }
   s.hover = s.pressed || best;
+}
+
+// ---------- effects (section 6): the 2D events, each guarded by its own vr* variable ----------
+const PMAX = 400;                                    // pooled cubes: one InstancedMesh, one draw call
+const FONT_BIG = '260px "VT323", monospace';
+const ACH = {                                        // mirrors ACH in index.html (the bridge does not expose it)
+  'first-blood': { title:'First blood', icon:'🩸' },
+  'nine-master': { title:'Nine-master', icon:'9️⃣' },
+  'speedrun':    { title:'Gotta go fast', icon:'💨' },
+  'full-stack':  { title:'Full stack', icon:'📦' },
+  'sixty-seven': { title:'Six seven', icon:'🎰' },
+  'knockout':    { title:'A knockout!', icon:'🥊' },
+  'comeback':    { title:'Comeback kid', icon:'🔁' },
+  'diamond':     { title:'Diamonds!', icon:'💎' },
+  'creeper':     { title:'Creeper survivor', icon:'💥' },
+  'steamboat':   { title:'Steamboat', icon:'🚢' },
+  'abstracted':  { title:'Abstracted', icon:'🌀' },
+};
+let vrFxN = 0, vr67N = 0, vrBoomN = 0, vrGlitchN = 0, vrWhistleN = 0, vrWin = false;
+const vrAchShown = new Set();                        // 'id:slot:n' keys already toasted
+const fxDrops = new Set();                           // drop() of every live per-instance effect object; teardown calls them all
+const scaleLock = new Set();                         // cell keys whose scale.y a tween owns (syncScene leaves them alone)
+const pool = [];                                     // particle slots {life, max, g, spin, pos, vel, rot, size}
+const greyMats = [], toastList = [];                 // glitch greys (shared); live toasts, index = stack position
+let pMesh = null, pGeo = null, pMat = null, pLive = 0;
+let earGeo = null, earMat = null, ears = null, toastGeo = null, toastEdgeGeo = null, shakeCancel = null;
+const GOLD = new THREE.Color(0xffd800), WHITE = new THREE.Color(0xffffff);
+const _e = new THREE.Euler(), _q = new THREE.Quaternion(), _m = new THREE.Matrix4();
+const sym = () => Math.random() * 2 - 1;
+const backOut = p => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(p - 1, 3) + c1 * Math.pow(p - 1, 2); };
+function bounceOut(x) {
+  const n1 = 7.5625, d1 = 2.75;
+  if (x < 1 / d1) return n1 * x * x;
+  if (x < 2 / d1) return n1 * (x -= 1.5 / d1) * x + 0.75;
+  if (x < 2.5 / d1) return n1 * (x -= 2.25 / d1) * x + 0.9375;
+  return n1 * (x -= 2.625 / d1) * x + 0.984375;
+}
+function fxBuild() {
+  pGeo = own(new THREE.BoxGeometry(1, 1, 1));
+  pMat = own(new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  pMesh = new THREE.InstancedMesh(pGeo, pMat, PMAX);
+  pMesh.frustumCulled = false;
+  const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
+  pool.length = 0;
+  for (let i = 0; i < PMAX; i++) {
+    pMesh.setMatrixAt(i, hidden); pMesh.setColorAt(i, WHITE);
+    pool.push({ life: 0, max: 0, g: 0, spin: 0, pos: new THREE.Vector3(), vel: new THREE.Vector3(), rot: new THREE.Vector3(), size: new THREE.Vector3(1, 1, 1) });
+  }
+  board.add(pMesh);
+  earGeo = own(new THREE.SphereGeometry(0.03, 12, 8));
+  earMat = own(new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  toastGeo = own(new THREE.PlaneGeometry(0.5, 0.15));
+  toastEdgeGeo = own(new THREE.PlaneGeometry(0.52, 0.17));
+  greyMats.length = 0;
+  for (const g of [0x444444, 0x777777, 0xaaaaaa]) greyMats.push(own(new THREE.MeshStandardMaterial({ color: g })));
+}
+// Guards start from the state on screen, so VR joining mid-match does not replay old events.
+function fxSeed(S) {
+  if (!S) return;
+  vrFxN = S.n; vr67N = S.n; vrBoomN = S.n; vrGlitchN = S.n; vrWhistleN = S.n; vrWin = S.winner != null;
+  for (const a of S.ach) vrAchShown.add(a.id + ':' + a.slot + ':' + a.n);
+}
+// Stops every live effect at once (session end, Escape, failed start). Board and tweens are dropped by the caller.
+function fxReset() {
+  for (const d of [...fxDrops]) d();
+  fxDrops.clear();
+  removeEars();
+  pool.length = 0; pLive = 0; pMesh = null; greyMats.length = 0; toastList.length = 0;
+  scaleLock.clear(); shakeCancel = null;
+  if (board) board.position.set(0, 0, 0);
+  vrFxN = vr67N = vrBoomN = vrGlitchN = vrWhistleN = 0; vrWin = false; vrAchShown.clear();
+}
+// Sprite with a per-instance material. The cached text texture is shared, so only the material is disposed.
+function fxText(parent, text, opts = {}) {
+  const sp = makeText(text, opts);
+  if (opts.w) sp.scale.multiplyScalar(opts.w / sp.scale.x);
+  parent.add(sp);
+  const drop = () => { if (!fxDrops.delete(drop)) return; sp.removeFromParent(); sp.material.dispose(); };
+  fxDrops.add(drop);
+  return { sp, drop };
+}
+// Flat overlay on a cell (shared cell geometry, per-instance material).
+function fxMesh(parent, geo, color, x, y, z, sx, sz) {
+  const mat = new THREE.MeshBasicMaterial({ color, transparent: true, depthWrite: false });
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(x, y, z); m.scale.set(sx, 1, sz); parent.add(m);
+  const drop = () => { if (!fxDrops.delete(drop)) return; m.removeFromParent(); mat.dispose(); };
+  fxDrops.add(drop);
+  return { mat, drop };
+}
+// Pooled cube, board-local coordinates. Dead slots are scaled to zero, so nothing is created or disposed per particle.
+function spawnPart(x, y, z, vx, vy, vz, life, g, size, color, spin) {
+  const i = pool.findIndex(p => p.life <= 0);
+  if (i < 0 || !pMesh) return;
+  const p = pool[i];
+  p.life = p.max = life; p.g = g; p.spin = spin;
+  p.pos.set(x, y, z); p.vel.set(vx, vy, vz); p.size.set(size[0], size[1], size[2]);
+  p.rot.set(Math.random() * 6, Math.random() * 6, 0);
+  pMesh.setColorAt(i, color); pMesh.instanceColor.needsUpdate = true;
+  _q.setFromEuler(_e.set(p.rot.x, p.rot.y, 0));
+  pMesh.setMatrixAt(i, _m.compose(p.pos, _q, p.size));
+  pLive++;
+}
+function makeEars() {                                // 1928 ears: two white spheres, on the roll cursor or the target cell
+  ears = new THREE.Group();
+  for (const x of [-0.06, 0.06]) { const m = new THREE.Mesh(earGeo, earMat); m.position.x = x; ears.add(m); }
+  ears.visible = false; board.add(ears);
+}
+function removeEars() { if (ears) { ears.removeFromParent(); ears = null; } }
+// Board-only shake. The camera never moves.
+function shake(amp, ms) {
+  if (shakeCancel) { shakeCancel(); shakeCancel = null; }
+  shakeCancel = animate(ms, p => { const k = amp * (1 - p); board.position.set(sym() * k, sym() * k, 0); },
+    () => { board.position.set(0, 0, 0); shakeCancel = null; });
+}
+
+function fxClaim(S, key) {                           // claim: the cell bounces from 6 down to 4, cubes burst in the owner's colour
+  const [r, c] = key.split('-').map(Number), cell = cellMesh[key], x = cellX(c), z = cellZ(r);
+  const col = matP[S.last.slot].emissive, ore = (S.ore || []).includes(key);
+  scaleLock.add(key); cell.scale.y = 6;
+  animate(400, p => { cell.scale.y = 6 + (4 - 6) * backOut(p); }, () => { cell.scale.y = 4; scaleLock.delete(key); });
+  for (let i = 0; i < 40; i++) spawnPart(x, 1.0, z, sym() * 0.4, 0.8 + Math.random() * 1.4, sym() * 0.4, 1.2, 2.5, [0.01, 0.01, 0.01], col, Math.random() * 8);
+  const t = fxText(board, ore ? '+2' : '+1', { k: 1.2, color: ore ? '#5fe6ff' : '#' + col.getHexString() });
+  t.sp.position.set(x, 1.0, z);
+  animate(1200, p => { t.sp.position.y = 1.0 + 0.15 * ease(p); t.sp.material.opacity = 1 - p; }, () => t.drop());
+}
+function fxMiss(key) {                               // miss: red flash on the cell, grey MISS rises, board shakes 1 cm
+  const [r, c] = key.split('-').map(Number), x = cellX(c), z = cellZ(r);
+  const f = fxMesh(board, cellGeo, 0xff2a2a, x, 0.98, z, 1.05, 1.05);
+  animate(400, p => { f.mat.opacity = 1 - p; }, () => f.drop());
+  const t = fxText(board, 'MISS', { color: '#9e9e9e', k: 1.0 }); t.sp.position.set(x, 1.0, z);
+  animate(900, p => { t.sp.position.y = 1.0 + 0.15 * ease(p); t.sp.material.opacity = 1 - p; }, () => t.drop());
+  shake(0.01, 300);
+}
+function fxBoom(boom) {                              // creeper: white flash, lost blocks fly off, board shakes 2 cm
+  const [r, c] = boom.key.split('-').map(Number);
+  const f = fxMesh(board, cellGeo, 0xffffff, cellX(c), 0.98, cellZ(r), 1.05, 1.05);
+  animate(400, p => { f.mat.opacity = 1 - p; }, () => f.drop());
+  for (const l of boom.lost) {
+    const [lr, lc] = l.key.split('-').map(Number);
+    spawnPart(cellX(lc), 1.0, cellZ(lr), sym() * 1.2, 1.5 + Math.random() * 1.5, sym() * 1.2, 1.5, 3, [0.1, 0.08, 0.1], matP[l.slot].emissive, 6 + Math.random() * 4);
+  }
+  shake(0.02, 400);
+}
+function fxGlitch() {                                // answer 0: 2 s of jitter and grey cells; #msg scramble reaches the panel by itself
+  const keys = Object.keys(cellMesh);
+  let tick = -1, hit = [];
+  animate(2000, p => {
+    const t = Math.floor(p * 2000 / 90);
+    if (t === tick) return; tick = t;
+    for (const m of hit) m.position.y = 0.95;
+    hit = [];
+    for (let i = 0; i < 25; i++) {
+      const m = cellMesh[keys[Math.random() * keys.length | 0]];
+      m.position.y = 0.95 + sym() * 0.02; m.material = greyMats[Math.random() * greyMats.length | 0];
+      hit.push(m);
+    }
+  }, () => { for (const m of hit) m.position.y = 0.95; syncScene(Z.state); });
+}
+function fxWhistle() {                               // ears pop in; they stay for the rest of the match (makeEars / removeEars)
+  const g = ears; if (!g) return;
+  g.scale.setScalar(0.01);
+  animate(300, p => g.scale.setScalar(Math.max(0.01, ease(p))));
+}
+function fxWin() {                                   // 200 cubes fountain from the board
+  const cols = [matP[0].emissive, matP[1].emissive, GOLD, WHITE];
+  let spawned = 0;
+  animate(1200, p => {
+    const want = Math.floor(p * 200);
+    while (spawned < want) {
+      spawned++;
+      spawnPart(sym() * 0.2, 0.95, -1.1 + sym() * 0.2, sym() * 1.1, 2.6 + Math.random() * 1.2, sym() * 1.1, 3, 3.5, [0.012, 0.012, 0.012], cols[Math.random() * cols.length | 0], Math.random() * 8);
+    }
+  });
+}
+function fx67() {                                    // 67: rows and columns 6 and 7 bob, SIX then SEVEN! drop in, 60 digits fall
+  const bobs = [];
+  for (const k in cellMesh) { const [r, c] = k.split('-').map(Number); if (r === 6 || r === 7 || c === 6 || c === 7) bobs.push({ m: cellMesh[k], s: (r + c) % 2 ? 1 : -1 }); }
+  const falls = [];
+  for (let i = 0; i < 60; i++) {
+    const f = fxText(scene, i % 2 ? '7' : '6', { k: 2, color: i % 2 ? '#ffd800' : '#ffffff' });
+    f.sp.position.set(-1.8 + Math.random() * 3.6, 0, -2.0 + Math.random() * 2.6);
+    falls.push({ sp: f.sp, drop: f.drop, y0: 3.2 + Math.random(), v: 0.6 + Math.random() * 0.6 });
+  }
+  const six = fxText(scene, 'SIX', { font: FONT_BIG, lh: 230, color: '#ffd800', w: 2 });
+  six.sp.position.set(0, 4, -1.6);
+  let seven = null;
+  animate(3000, p => {
+    const t = p * 3000;
+    for (const b of bobs) b.m.position.y = 0.95 + 0.03 * Math.sin(t * 0.0113) * b.s;   // about 1.8 Hz
+    for (const f of falls) { f.sp.position.y = f.y0 - f.v * t / 1000; f.sp.visible = f.sp.position.y > 0; }
+    if (t < 750) { six.sp.position.y = 4 - 1.4 * bounceOut(Math.min(1, t / 600)); return; }
+    six.drop();
+    if (!seven) { seven = fxText(scene, 'SEVEN!', { font: FONT_BIG, lh: 230, color: '#ffd800', w: 2 }); seven.sp.position.set(0, 4, -1.6); }
+    seven.sp.position.y = 4 - 1.4 * bounceOut(Math.min(1, (t - 750) / 600));
+  }, () => {
+    for (const b of bobs) b.m.position.y = 0.95;
+    for (const f of falls) f.drop();
+    six.drop(); if (seven) seven.drop();
+  });
+}
+function achToast(a) {                               // achievement: panel slides in from the left, stays 3 s, fades
+  const def = ACH[a.id];
+  if (!def || !scene) return;
+  if (toastList.length >= 3) toastList[0].drop();
+  const grp = new THREE.Group(); grp.position.set(-1.5, 1.4, -1.3); scene.add(grp);
+  const bgMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, depthWrite: false });
+  const edgeMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, depthWrite: false });
+  const edge = new THREE.Mesh(toastEdgeGeo, edgeMat); edge.position.z = -0.001;
+  grp.add(edge, new THREE.Mesh(toastGeo, bgMat));
+  const head = fxText(grp, 'ACHIEVEMENT GET!', { k: 0.45, color: '#bbbbbb' }); head.sp.position.set(0, 0.05, 0.002);
+  const title = fxText(grp, def.icon + '  ' + def.title, { k: 0.9, box: [0.46, 0.055] }); title.sp.position.set(0, 0, 0.002);
+  const who = fxText(grp, Z.name(a.slot), { k: 0.5, color: '#bbbbbb', box: [0.46, 0.04] }); who.sp.position.set(0, -0.05, 0.002);
+  const sprites = [head.sp, title.sp, who.sp];
+  const item = { drop: null };
+  const drop = () => {
+    if (!fxDrops.delete(drop)) return;
+    const i = toastList.indexOf(item); if (i >= 0) toastList.splice(i, 1);
+    grp.removeFromParent(); bgMat.dispose(); edgeMat.dispose();
+    head.drop(); title.drop(); who.drop();
+  };
+  item.drop = drop; fxDrops.add(drop); toastList.push(item);
+  animate(3400, p => {
+    const t = p * 3400;
+    grp.position.x = -1.5 + 0.6 * ease(Math.min(1, t / 250));
+    grp.position.y = 1.4 - 0.18 * Math.max(0, toastList.indexOf(item));
+    const fade = t < 3000 ? 1 : Math.max(0, 1 - (t - 3000) / 400);
+    bgMat.opacity = 0.85 * fade; edgeMat.opacity = fade;
+    for (const s of sprites) s.material.opacity = fade;
+  }, () => drop());
+}
+// Runs on every state callback. Guards first, then effects; effects wait while a roll replay is in progress,
+// and syncScene runs again when the replay lands, so claim / miss / 67 / boom play after the roll.
+function fxSync(S) {
+  if (S.n === 0) { vrFxN = vr67N = vrBoomN = vrGlitchN = vrWhistleN = 0; vrWin = false; if (!S.ach.length) vrAchShown.clear(); }
+  for (const a of S.ach) { const k = a.id + ':' + a.slot + ':' + a.n; if (!vrAchShown.has(k)) { vrAchShown.add(k); achToast(a); } }
+  if (S.ears) { if (!ears) makeEars(); } else removeEars();
+  if (vrRolling) return;
+  if (S.ev67 && S.ev67.n === S.n && vr67N !== S.n && (S.ev67.kind === 'roll' || S.phase === 'idle')) { vr67N = S.n; fx67(); }
+  if (S.boom && S.boom.n === S.n && vrBoomN !== S.n) { vrBoomN = S.n; fxBoom(S.boom); }
+  if (S.glitch && S.glitch.n === S.n && vrGlitchN !== S.n) { vrGlitchN = S.n; fxGlitch(); }
+  if (S.evWhistle && S.evWhistle.n === S.n && vrWhistleN !== S.n) { vrWhistleN = S.n; fxWhistle(); }
+  if (S.last) {
+    if (vrFxN !== S.n) { vrFxN = S.n; if (S.last.ok) fxClaim(S, S.last.r + '-' + S.last.c); else fxMiss(S.last.r + '-' + S.last.c); }
+  } else vrFxN = 0;
+  if (S.winner != null) { if (!vrWin) { vrWin = true; fxWin(); } } else vrWin = false;
+}
+// Per-frame: ears follow the roll cursor (or the target cell while answering), and live particles step with dt.
+function fxUpdater(now, dt) {
+  if (ears) {
+    const st = Z.state;
+    let x = null, z = null;
+    if (rowBar.visible) { x = colBar.position.x; z = rowBar.position.z; }
+    else if (st && st.roll && st.phase === 'answer' && !vrRolling) { x = cellX(st.roll.c); z = cellZ(st.roll.r); }
+    ears.visible = x !== null;
+    if (x !== null) ears.position.set(x, 1.03, z);
+  }
+  if (!pLive) return;
+  for (let i = 0; i < PMAX; i++) {
+    const p = pool[i];
+    if (p.life <= 0) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.life = 0; pLive--; pMesh.setMatrixAt(i, _m.makeScale(0, 0, 0)); continue; }
+    p.vel.y -= p.g * dt;
+    p.pos.addScaledVector(p.vel, dt);
+    p.rot.x += p.spin * dt; p.rot.y += p.spin * 0.6 * dt;
+    _q.setFromEuler(_e.set(p.rot.x, p.rot.y, 0));
+    pMesh.setMatrixAt(i, _m.compose(p.pos, _q, p.size));
+  }
+  pMesh.instanceMatrix.needsUpdate = true;
 }
 
 // ---------- frame loop ----------
@@ -556,7 +827,7 @@ function disposeObject(o) {
 function teardown() {
   if (!active || tearingDown) return;
   tearingDown = true;
-  abortRoll(); tweens.clear(); updaters.clear();
+  abortRoll(); tweens.clear(); updaters.clear(); fxReset();
   if (session && !sessionEnded) { try { session.end().catch(() => {}); } catch (_) {} }
   for (const fn of cleanup.splice(0).reverse()) { try { fn(); } catch (_) {} }
   if (scene) scene.traverse(disposeObject);
@@ -608,10 +879,12 @@ export async function start(Z_) {
 
     build();
     vrShownN = Z.state ? Z.state.n : 0;                 // do not replay a roll that is already on the board
+    fxSeed(Z.state);                                    // nor a claim, 67, boom, glitch, whistle, win or achievement already on the board
     updaters.add(mirrorPanel);
     updaters.add(spinGems);
     updaters.add(tweenUpdater);
     updaters.add(pointUpdater);
+    updaters.add(fxUpdater);
     unsubState = Z.onState(syncScene);
     cleanup.push(() => { if (unsubState) unsubState(); });
 
@@ -631,6 +904,7 @@ export async function start(Z_) {
       get scene() { return scene; }, get camera() { return camera; }, cellMesh,
       get rolling() { return vrRolling; }, get typed() { return typed; },
       get desk() { return desk; }, get active() { return active; },
+      get fx() { return fxDrops.size + pLive; },        // live effect objects (for leak checks)
       end: () => teardown()
     };
   } catch (e) {
