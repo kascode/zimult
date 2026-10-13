@@ -160,7 +160,11 @@ function press(t) {
 }
 
 // ---------- numpad, FIGHT, PLAY AGAIN (section 5) ----------
-function updateDisplay() { if (padDisplay) padDisplay.setText(typed ? typed.padEnd(4, '_') : '____'); }
+function updateDisplay() {                              // the question itself: the 2D view shows it next to its input, not in #msg
+  if (!padDisplay) return;
+  const st = Z && Z.state, q = st && st.roll && st.phase === 'answer' ? st.roll.r + ' × ' + st.roll.c + ' = ' : '';
+  padDisplay.setText(q + (typed ? typed.padEnd(4, '_') : '____'));
+}
 function keyPress(label) {
   if (!pad || !pad.visible) return;
   if (DIGITS.test(label)) { if (typed.length < 4) typed += label; }
@@ -286,6 +290,7 @@ function build() {
   rowBar = new THREE.Mesh(own(new THREE.BoxGeometry(1.15, 0.015, 0.1)), barMat);
   colBar = new THREE.Mesh(own(new THREE.BoxGeometry(0.1, 0.015, 1.15)), barMat);
   rowBar.position.y = colBar.position.y = 0.985;
+  colBar.position.z = cellZ((GRID + 1) / 2);              // centre the column bar on the board, not on the origin
   rowBar.visible = colBar.visible = false;
   board.add(rowBar, colBar);
   flash = new THREE.Sprite(own(new THREE.SpriteMaterial({ map: glowTex, transparent: true, depthWrite: false })));
@@ -313,8 +318,9 @@ function build() {
     return { name, fill };
   });
 
-  // numpad (group at (0.45, 1.15, -0.55), tilted), its display, FIGHT under it, PLAY AGAIN mirrored on the left
-  pad = new THREE.Group(); pad.position.set(0.45, 1.15, -0.55); pad.rotation.x = TILT; lift.add(pad);
+  // numpad (group at (0.75, 1.15, -0.35), tilted: right of the board and nearer the player, so it never hides columns 9-10),
+  // its display, FIGHT under it, PLAY AGAIN mirrored on the left
+  pad = new THREE.Group(); pad.position.set(0.75, 1.15, -0.35); pad.rotation.x = TILT; lift.add(pad);
   const backing = new THREE.Mesh(own(new THREE.PlaneGeometry(0.3, 0.5)), own(new THREE.MeshBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.85 })));
   backing.position.set(0, 0.02, -0.01); pad.add(backing);
   const keys = [['7', '8', '9'], ['4', '5', '6'], ['1', '2', '3'], [KEY_MAP.Backspace, '0', KEY_MAP.Enter]];
@@ -322,13 +328,13 @@ function build() {
     const label = keys[row][col];
     addTile({ parent: pad, x: (col - 1) * 0.09, y: (1.5 - row) * 0.09, w: 0.08, h: 0.08, label, onPress: () => keyPress(label) });
   }
-  padDisplay = makeText('____', { font: FONT_LABEL, k: 0.8, color: '#ffd800' });
-  padDisplay.position.set(0, 0.235, 0.01); pad.add(padDisplay);
+  padDisplay = makeText('____', { font: FONT_LABEL, k: 0.8, color: '#ffd800', box: [0.3, 0.06] });
+  padDisplay.position.set(0, 0.235, 0.01); padDisplay.renderOrder = 1; pad.add(padDisplay);   // draw after the translucent backing
   pad.updateMatrixWorld(true);
   const fightAt = pad.localToWorld(new THREE.Vector3(0, -0.27, 0));
   fightTile = addTile({ parent: lift, x: fightAt.x, y: fightAt.y, z: fightAt.z, rotX: TILT, w: 0.3, h: 0.1, label: 'FIGHT', font: FONT_LABEL, k: 0.6, key: 'fight', onPress: roll });
   fightTile.obj.visible = false;
-  againTile = addTile({ parent: lift, x: -0.45, y: 1.2, z: -0.55, rotX: TILT, w: 0.6, h: 0.14, label: 'PLAY AGAIN', font: FONT_LABEL, k: 0.7, key: 'again', onPress: again });
+  againTile = addTile({ parent: lift, x: -0.75, y: 1.2, z: -0.35, rotX: TILT, w: 0.6, h: 0.14, label: 'PLAY AGAIN', font: FONT_LABEL, k: 0.7, key: 'again', onPress: again });
   againTile.obj.visible = false;
   // section 9: EXIT beside the numpad (always shown); SEATED on the pedestal front, so it moves with the board
   const exitAt = pad.localToWorld(new THREE.Vector3(0.22, 0.135, 0));
@@ -484,7 +490,7 @@ function syncScene(S) {
   }
   if (showTarget) {
     const [r, c] = targetKey.split('-').map(Number);
-    targetLabel.setText(creeper ? '•_•' : ore.includes(targetKey) ? '◆' : '?');
+    targetLabel.setText((creeper ? '•_• ' : ore.includes(targetKey) ? '◆ ' : '') + r + '×' + c);
     targetLabel.position.set(cellX(c), topY(6) + 0.012, cellZ(r));
     targetLabel.visible = true;
   } else targetLabel.visible = false;
