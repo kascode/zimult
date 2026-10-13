@@ -15,7 +15,7 @@ const KEY_MAP = { Backspace: '⌫', Enter: '↵' };   // backspace / return glyp
 const FALLBACK_P = ['#c8551d', '#1f7a8c'];         // Classic skin hero colours, used when --p1/--p2 are unset
 
 // ---------- module state (everything here is reset by teardown) ----------
-let active = false, tearingDown = false, sessionEnded = false;
+let active = false, tearingDown = false, sessionEnded = false, runGen = 0;
 let Z = null, desk = false, GRID = 10, GOAL = 10;
 let renderer = null, scene = null, camera = null, session = null, canvas = null;
 let board = null;                                   // pedestal + slab + cells + labels + roll bars: lowered or shaken as one
@@ -135,22 +135,23 @@ function addTile({ parent, x = 0, y = 0, z = 0, rotX = 0, w, h, label, font = FO
 }
 function paintTiles() {
   for (const t of tiles) {
-    const down = sources.some(s => s.pressed === t);
-    const shade = down ? 2 : sources.some(s => s.hover === t) ? 1 : 0;
+    let shade = 0;
+    for (const s of sources) { if (s.pressed === t) { shade = 2; break; } if (s.hover === t) shade = 1; }
     if (shade !== t.shade) { t.shade = shade; t.mat.color.setHex(shade === 2 ? 0xffd800 : shade === 1 ? 0xff7f27 : 0x000000); }
   }
 }
+const pickMeshes = [], pickHits = [];               // reused every frame (no per-frame allocation)
 function pick() {
-  const meshes = [];
-  for (const t of tiles) if (shown(t.obj)) meshes.push(t.mesh);
-  if (!meshes.length) return null;
-  const hit = raycaster.intersectObjects(meshes, false)[0];
+  pickMeshes.length = 0; pickHits.length = 0;
+  for (const t of tiles) if (shown(t.obj)) pickMeshes.push(t.mesh);
+  if (!pickMeshes.length) return null;
+  const hit = raycaster.intersectObjects(pickMeshes, false, pickHits)[0];
   return hit ? hit.object.userData.tile : null;
 }
-// Distance from a world point to a tile's front face, in metres (dz > 0 is in front of the face).
-function faceDist(t, p) {
+// Distance from a world point to a tile's front face, in metres (> 0 is in front of the face); NaN when off the tile.
+function faceDz(t, p) {
   v3b.copy(p); t.mesh.worldToLocal(v3b);               // mesh geometry is a unit box scaled to (w, h, 0.02)
-  return { dz: (v3b.z - 0.5) * 0.02, inside: Math.abs(v3b.x * t.w) <= t.w / 2 + 0.01 && Math.abs(v3b.y * t.h) <= t.h / 2 + 0.01 };
+  return Math.abs(v3b.x * t.w) <= t.w / 2 + 0.01 && Math.abs(v3b.y * t.h) <= t.h / 2 + 0.01 ? (v3b.z - 0.5) * 0.02 : NaN;
 }
 function press(t) {
   if (!t || !t.onPress) return;
@@ -447,6 +448,8 @@ function abortRoll() {
 function syncScene(S) {
   if (!board || !S) return;
   paintHeroColours();
+  if (vrRolling && S.n !== vrShownN) abortRoll();     // a newer round or a reset arrived mid-roll
+  if (S.n === 0) vrShownN = 0;                        // new match: its round 1 must replay even if the old one ended at round 1
   if (S.roll && S.n !== vrShownN) { vrShownN = S.n; startRoll(S.roll); }   // may clear vrRolling (reduced motion)
   const hold = vrRolling ? rollKey : null;            // the roll tween owns this cell until it lands
   const targetKey = S.roll && S.phase === 'answer' ? S.roll.r + '-' + S.roll.c : null;
@@ -490,8 +493,8 @@ function syncScene(S) {
 
   // controls: numpad while answering, FIGHT while it is your roll, PLAY AGAIN when the match is over
   const over = S.winner != null;
-  const seated = Z.mode === 'local' || !!(S.seats && S.seats[0] && S.seats[1]);
-  const mine = !over && seated && Z.canAct(S.turn);
+  const full = Z.mode === 'local' || !!(S.seats && S.seats[0] && S.seats[1]);   // P2P: both seats taken
+  const mine = !over && full && Z.canAct(S.turn);
   if (S.n !== typedN) { typed = ''; typedN = S.n; }
   pad.visible = mine && S.phase === 'answer' && !hold;
   fightTile.obj.visible = mine && S.phase === 'idle';
@@ -511,8 +514,8 @@ function animate(ms, step, done) {
   return () => tweens.delete(job);
 }
 function tweenUpdater(now) {
-  for (const job of [...tweens]) {
-    const p = Math.min(1, (now - job.t0) / job.ms);
+  for (const job of tweens) {                           // deleting the current entry while iterating a Set is safe
+    const p = Math.max(0, Math.min(1, (now - job.t0) / job.ms));   // a job added this frame can start a hair after now
     job.step(p);
     if (p >= 1) { tweens.delete(job); if (job.done) job.done(); }
   }
@@ -527,26 +530,32 @@ function spinGems(now, dt) {
   for (const k in gemFor) if (gemFor[k].visible) gemFor[k].rotation.y += dt * 1.5;
 }
 // Pointing: controllers cast along their own forward, hands use the index tip (both feed sources[]).
+const _rm = new THREE.Matrix4();
 function pointUpdater() {
   for (const s of sources) {
-    if (s.obj) { raycaster.setFromXRController(s.obj); raycaster.far = 1.5; s.hover = pick(); }
-    else if (s.hand) updateHand(s);
+    if (s.obj) {                                        // three r160 has no Raycaster.setFromXRController
+      if (!s.obj.visible) { s.hover = null; continue; }
+      _rm.identity().extractRotation(s.obj.matrixWorld);
+      raycaster.ray.origin.setFromMatrixPosition(s.obj.matrixWorld);
+      raycaster.ray.direction.set(0, 0, -1).applyMatrix4(_rm);
+      raycaster.far = 1.5; s.hover = pick();
+    } else if (s.hand) updateHand(s);
   }
 }
 function updateHand(s) {
   const tip = s.hand.joints && s.hand.joints['index-finger-tip'];
   if (!tip || !tip.visible) { s.hover = null; s.pressed = null; return; }
   tip.getWorldPosition(v3);
-  let best = null, bf = null;
+  let best = null, bd = 0;
   for (const t of tiles) {
     if (!shown(t.obj)) continue;
-    const f = faceDist(t, v3);
-    if (!f.inside || f.dz < -0.03 || f.dz > 0.05) continue;
-    if (!bf || Math.abs(f.dz) < Math.abs(bf.dz)) { best = t; bf = f; }
+    const dz = faceDz(t, v3);
+    if (!(dz >= -0.03 && dz <= 0.05)) continue;       // NaN (off the tile) fails too
+    if (!best || Math.abs(dz) < Math.abs(bd)) { best = t; bd = dz; }
   }
   if (s.pressed && !shown(s.pressed.obj)) s.pressed = null;          // tile hidden while held (numpad closed, say)
-  if (s.pressed) { const f = faceDist(s.pressed, v3); if (!f.inside || f.dz > 0.03) s.pressed = null; }   // released once the tip leaves
-  else if (best && bf.dz < 0.015) { s.pressed = best; press(best); }  // pressed within 1.5 cm of the front face
+  if (s.pressed) { if (!(faceDz(s.pressed, v3) <= 0.03)) s.pressed = null; }   // released once the tip leaves
+  else if (best && bd < 0.015) { s.pressed = best; press(best); }     // pressed within 1.5 cm of the front face
   s.hover = s.pressed || best;
 }
 
@@ -943,7 +952,6 @@ function frame() {
   scene.updateMatrixWorld();
   for (const fn of updaters) fn(now, dt);
   if (!renderer) return;                              // an updater may have ended the session (EXIT in desktop mode)
-  // section 6 / 7 / 9 updaters register into `updaters` in their own build step
   paintTiles();
   flushCells();
   renderer.render(scene, camera);
@@ -1034,7 +1042,7 @@ function disposeObject(o) {
 // Idempotent. Used on session end, Escape in desktop mode, and when start() fails part-way.
 function teardown() {
   if (!active || tearingDown) return;
-  tearingDown = true;
+  tearingDown = true; runGen++;
   abortRoll(); tweens.clear(); updaters.clear(); fxReset();
   if (session && !sessionEnded) { try { session.end().catch(() => {}); } catch (_) {} }
   for (const fn of cleanup.splice(0).reverse()) { try { fn(); } catch (_) {} }
@@ -1064,18 +1072,22 @@ function teardown() {
   active = false; tearingDown = false;
 }
 
-export async function start(Z_) {
-  if (active) return;
+// opts.session: an XR session the caller already requested inside the click's user activation (index.html enterVR does,
+// because this module and three.js may take longer to download than the activation lasts). opts.desk: flat-canvas mode.
+export async function start(Z_, opts = {}) {
+  if (active) { if (opts.session) opts.session.end().catch(() => {}); return; }
   active = true; Z = Z_;
-  desk = location.hash === '#vrdesk';
+  const gen = runGen;
+  desk = opts.desk != null ? !!opts.desk : location.hash === '#vrdesk';
   try {
     if (!desk) {
-      // requestSession first, so it still runs inside the click's user activation
-      if (!navigator.xr) throw new Error('WebXR is not available in this browser.');
-      session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] });
-      session.addEventListener('end', () => { sessionEnded = true; teardown(); });
+      if (!opts.session && !navigator.xr) throw new Error('WebXR is not available in this browser.');
+      const s = session = opts.session || await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] });
+      // deferred so three.js's own 'end' handler runs on a live renderer; ignored if this session was already torn down
+      s.addEventListener('end', () => setTimeout(() => { if (s === session) { sessionEnded = true; teardown(); } }, 0));
     }
     await document.fonts.ready;
+    if (gen !== runGen) return;                         // torn down while waiting (session ended)
     GRID = Z.N || 10; GOAL = Z.GOAL || 10;
 
     renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -1110,6 +1122,7 @@ export async function start(Z_) {
       renderer.xr.setReferenceSpaceType('local-floor');
       renderer.xr.setFramebufferScaleFactor(1.0);
       await renderer.xr.setSession(session);
+      if (gen !== runGen) return;
       canvas.style.display = '';
       attachControllers();
     }

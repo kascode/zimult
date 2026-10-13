@@ -736,7 +736,7 @@ function toast(a){
 
 async function render() {
   if (!S || animating) return;
-  for (const fn of stateListeners) fn(S);
+  for (const fn of stateListeners) { try { fn(S); } catch (e) { console.error(e); } }   // a renderer bug must not stop the 2D game
   cpuTick();
   if (S.n === 0 && S.ach.length === 0) achShown.clear();
   if (S.n === 0) { whistleShown = 0; glitchShown = 0; }
@@ -896,8 +896,19 @@ $('soloBtn').onclick = startSolo;
 $('streakBtn').onclick = startStreak;
 // ---------- VR entry: the menu section and header button appear only with WebXR immersive-vr (or #vrdesk for desktop tests) ----------
 async function enterVR(){
-  try { const m = await import('./vr.js'); await m.start(window.ZIMULT); }
-  catch (e) { const t = 'VR could not start: ' + (e && e.message || e); if (!$('lobby').hidden) { lmsg.textContent = t; lmsg.className = 'msg bad'; } else setMsg(t, 'bad'); }
+  const desk = location.hash === '#vrdesk';
+  let session = null;
+  try {
+    // requestSession runs first, synchronously inside the click's user activation; the vr.js + three.js download can outlast it
+    if (!desk) {
+      if (!navigator.xr) throw new Error('WebXR is not available in this browser.');
+      session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] });
+    }
+    const m = await import('./vr.js'); await m.start(window.ZIMULT, { session, desk });
+  } catch (e) {
+    if (session) session.end().catch(() => {});
+    const t = 'VR could not start: ' + (e && e.message || e); if (!$('lobby').hidden) { lmsg.textContent = t; lmsg.className = 'msg bad'; } else setMsg(t, 'bad');
+  }
 }
 async function vrSupported(){ try { return !!(navigator.xr && await navigator.xr.isSessionSupported('immersive-vr')); } catch (_) { return false; } }
 const showVR = () => { $('vrSec').hidden = false; $('vrBtn').hidden = false; };
