@@ -19,7 +19,9 @@ let active = false, tearingDown = false, sessionEnded = false;
 let Z = null, desk = false, GRID = 10, GOAL = 10;
 let renderer = null, scene = null, camera = null, session = null, canvas = null;
 let board = null;                                   // pedestal + slab + cells + labels + roll bars: lowered or shaken as one
-const cellMesh = {}, labelFor = {}, gemFor = {};    // 'r-c' -> Mesh (cell) / Sprite (product label) / Mesh (ore gem)
+const cellMesh = {}, gemFor = {};                   // 'r-c' -> CellProxy (cell, drawn instanced) / Mesh (ore gem)
+const SEAT_KEY = 'ttd-vr-seated', SEAT_DROP = 0.35;  // section 9: seated mode lowers the board, numpad and tiles by this much
+let seated = false, lift = null, seatTile = null, exitTile = null;
 let tileGeo = null, edgeGeo = null, cellGeo = null, gemGeo = null, lineMat = null;
 let matFree = null, matCrater = null, matTarget = null, matCreeper = null, matGem = null, matP = [];
 let rowBar = null, colBar = null, flash = null, targetLabel = null, glowTex = null;
@@ -115,7 +117,7 @@ function makeGlow() {
 }
 
 // ---------- pressable tiles (section 5). Other sections register EXIT / SEATED through addTile too. ----------
-function addTile({ parent, x = 0, y = 0, z = 0, rotX = 0, w, h, label, font = FONT_TILE, k = 1, onPress }) {
+function addTile({ parent, x = 0, y = 0, z = 0, rotX = 0, w, h, label, font = FONT_TILE, k = 1, onPress, key }) {
   const grp = new THREE.Group();
   grp.position.set(x, y, z); grp.rotation.x = rotX;
   const mat = own(new THREE.MeshStandardMaterial({ color: 0x000000, roughness: 0.7 }));
@@ -126,7 +128,7 @@ function addTile({ parent, x = 0, y = 0, z = 0, rotX = 0, w, h, label, font = FO
   text.position.set(0, 0, 0.0125);                         // in front of the face; sprites are not parented to the scaled mesh
   grp.add(mesh, text);
   parent.add(grp);
-  const tile = { obj: grp, mesh, mat, w, h, label: text, onPress, shade: -1 };
+  const tile = { obj: grp, mesh, mat, w, h, label: text, onPress, shade: -1, key: key || label };
   mesh.userData.tile = tile;
   tiles.push(tile);
   return tile;
@@ -187,10 +189,6 @@ function paintHeroColours() {
     matP[s].emissive.copy(c);
   }
 }
-function productLabel(k) {
-  if (!labelFor[k]) { labelFor[k] = makeText('', { k: 0.8 }); labelFor[k].visible = false; board.add(labelFor[k]); }
-  return labelFor[k];
-}
 function gemOf(k) {
   if (!gemFor[k]) { gemFor[k] = new THREE.Mesh(gemGeo, matGem); gemFor[k].visible = false; board.add(gemFor[k]); }
   return gemFor[k];
@@ -242,8 +240,10 @@ function build() {
   const arena = new THREE.LineSegments(own(new THREE.EdgesGeometry(arenaBox)), lineMat);
   arena.position.set(0, 1.5, -1); scene.add(arena);
 
+  // lift: seated mode lowers it (board, numpad, FIGHT, PLAY AGAIN, EXIT). The dialogue panel and HP bars stay put.
+  lift = new THREE.Group(); scene.add(lift);
   // board group: pedestal, slab, cells, headers, roll bars, labels, gems
-  board = new THREE.Group(); scene.add(board);
+  board = new THREE.Group(); lift.add(board);
   const pedGeo = own(new THREE.BoxGeometry(1.3, 0.9, 1.3));
   const ped = new THREE.Mesh(pedGeo, own(new THREE.MeshStandardMaterial({ color: 0x111111 })));
   ped.position.set(0, 0.45, -1.1); board.add(ped);
@@ -254,10 +254,23 @@ function build() {
   slabEdges.position.copy(slab.position); board.add(slabEdges);
 
   for (let r = 1; r <= GRID; r++) for (let c = 1; c <= GRID; c++) {
-    const k = r + '-' + c, m = new THREE.Mesh(cellGeo, matFree);
-    m.position.set(cellX(c), 0.95, cellZ(r)); m.userData.key = k;
-    cellMesh[k] = m; board.add(m);
+    const k = r + '-' + c;
+    cellMesh[k] = new CellProxy(k, r, c);             // drawn by flushCells() into one InstancedMesh per material
   }
+  // product labels: one atlas texture and one instanced quad per owned cell, laid flat on the cell top
+  atlas = buildAtlas();
+  const labelGeo = own(new THREE.PlaneGeometry(0.08, 0.08));
+  labelGeo.rotateX(-Math.PI / 2);
+  labelAttr = new THREE.InstancedBufferAttribute(new Float32Array(GRID * GRID * 2), 2);
+  labelGeo.setAttribute('aOff', labelAttr);
+  const labelMat = own(new THREE.MeshBasicMaterial({ map: atlas.tex, transparent: true, depthWrite: false }));
+  labelMat.onBeforeCompile = sh => {                  // remap each quad's UVs into its own atlas slot
+    sh.vertexShader = 'attribute vec2 aOff;\n' + sh.vertexShader.replace('#include <uv_vertex>',
+      '#include <uv_vertex>\n#ifdef USE_MAP\nvMapUv = vMapUv * vec2(' + (1 / atlas.cols) + ', ' + (1 / atlas.rows) + ') + aOff;\n#endif');
+  };
+  labelMesh = new THREE.InstancedMesh(labelGeo, labelMat, GRID * GRID);
+  labelMesh.count = 0; labelMesh.visible = false; labelMesh.frustumCulled = false;
+  board.add(labelMesh);
   // headers on the slab rim: columns along the far edge, rows along the left edge
   for (let c = 1; c <= GRID; c++) {
     const h = makeText(String(c), { k: 0.5, color: '#ffffff' });
@@ -300,7 +313,7 @@ function build() {
   });
 
   // numpad (group at (0.45, 1.15, -0.55), tilted), its display, FIGHT under it, PLAY AGAIN mirrored on the left
-  pad = new THREE.Group(); pad.position.set(0.45, 1.15, -0.55); pad.rotation.x = TILT; scene.add(pad);
+  pad = new THREE.Group(); pad.position.set(0.45, 1.15, -0.55); pad.rotation.x = TILT; lift.add(pad);
   const backing = new THREE.Mesh(own(new THREE.PlaneGeometry(0.3, 0.5)), own(new THREE.MeshBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.85 })));
   backing.position.set(0, 0.02, -0.01); pad.add(backing);
   const keys = [['7', '8', '9'], ['4', '5', '6'], ['1', '2', '3'], [KEY_MAP.Backspace, '0', KEY_MAP.Enter]];
@@ -312,15 +325,81 @@ function build() {
   padDisplay.position.set(0, 0.235, 0.01); pad.add(padDisplay);
   pad.updateMatrixWorld(true);
   const fightAt = pad.localToWorld(new THREE.Vector3(0, -0.27, 0));
-  fightTile = addTile({ parent: scene, x: fightAt.x, y: fightAt.y, z: fightAt.z, rotX: TILT, w: 0.3, h: 0.1, label: 'FIGHT', font: FONT_LABEL, k: 0.6, onPress: roll });
+  fightTile = addTile({ parent: lift, x: fightAt.x, y: fightAt.y, z: fightAt.z, rotX: TILT, w: 0.3, h: 0.1, label: 'FIGHT', font: FONT_LABEL, k: 0.6, key: 'fight', onPress: roll });
   fightTile.obj.visible = false;
-  againTile = addTile({ parent: scene, x: -0.45, y: 1.2, z: -0.55, rotX: TILT, w: 0.6, h: 0.14, label: 'PLAY AGAIN', font: FONT_LABEL, k: 0.7, onPress: again });
+  againTile = addTile({ parent: lift, x: -0.45, y: 1.2, z: -0.55, rotX: TILT, w: 0.6, h: 0.14, label: 'PLAY AGAIN', font: FONT_LABEL, k: 0.7, key: 'again', onPress: again });
   againTile.obj.visible = false;
+  // section 9: EXIT beside the numpad (always shown); SEATED on the pedestal front, so it moves with the board
+  const exitAt = pad.localToWorld(new THREE.Vector3(0.22, 0.135, 0));
+  exitTile = addTile({ parent: lift, x: exitAt.x, y: exitAt.y, z: exitAt.z, rotX: TILT, w: 0.1, h: 0.08, label: 'EXIT', font: FONT_LABEL, k: 0.6, key: 'exit', onPress: exitVR });
+  seatTile = addTile({ parent: board, x: 0, y: 0.6, z: -0.445, w: 0.42, h: 0.1, label: 'SIT DOWN', font: FONT_TILE, k: 0.9, key: 'seat', onPress: toggleSeated });   // 0.25 m above the floor once seated
+  applySeated(readSeated());
 
   msgEl = document.getElementById('msg');
   codeBoxEl = document.getElementById('codebox');
   codeEl = document.getElementById('code');
+  buildPresence();                                    // section 7: opponent marker and solo face (scene objects only)
   fxBuild();                                          // section 6: shared effect geometry, particle pool
+}
+
+// ---------- cells drawn instanced (section 9 budget) ----------
+// Each cell is a CellProxy. Effects keep writing cell.scale.y, cell.position.y and cell.material as before; flushCells()
+// packs all cells into one InstancedMesh per material (free, p1, p2, crater, target, creeper, glitch greys), so the
+// board is a handful of draw calls. Product labels are one InstancedMesh sampling one atlas texture.
+const cellBuckets = new Map();                       // material -> InstancedMesh holding every cell with that material
+const UNIT_Q = new THREE.Quaternion(), _cm = new THREE.Matrix4(), _cp = new THREE.Vector3(), _cs = new THREE.Vector3();
+let cellsDirty = true, labelMesh = null, labelAttr = null, atlas = null;
+class CellProxy {
+  constructor(k, r, c) {
+    this.key = k; this.x = cellX(c); this.z = cellZ(r);
+    this.mat = matFree; this.sy = 1; this.py = 0.95; this.product = 0;
+    const me = this;
+    this.scale = { get y() { return me.sy; }, set y(v) { me.sy = v; cellsDirty = true; } };
+    this.position = { get y() { return me.py; }, set y(v) { me.py = v; cellsDirty = true; } };
+  }
+  get material() { return this.mat; }
+  set material(m) { this.mat = m; cellsDirty = true; }
+}
+function buildAtlas() {                              // every product that can appear on this grid, one canvas
+  const prods = [...new Set(Array.from({ length: GRID * GRID }, (_, i) => (Math.floor(i / GRID) + 1) * (i % GRID + 1)))].sort((a, b) => a - b);
+  const cols = 8, rows = Math.ceil(prods.length / cols), px = 128;
+  const cv = document.createElement('canvas'); cv.width = cols * px; cv.height = rows * px;
+  const g = cv.getContext('2d');
+  g.font = '84px "VT323", monospace'; g.fillStyle = '#ffffff'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  const index = new Map();
+  prods.forEach((p, i) => { index.set(p, i); g.fillText(String(p), (i % cols) * px + px / 2, Math.floor(i / cols) * px + px / 2 + 4); });
+  const tex = own(new THREE.CanvasTexture(cv)); tex.generateMipmaps = false; tex.minFilter = THREE.LinearFilter;
+  return { tex, cols, rows, index };
+}
+function cellBucket(mat) {
+  let b = cellBuckets.get(mat);
+  if (!b) {
+    b = new THREE.InstancedMesh(cellGeo, mat, GRID * GRID);
+    b.count = 0; b.visible = false; b.frustumCulled = false;
+    board.add(b); cellBuckets.set(mat, b);
+  }
+  return b;
+}
+function flushCells() {
+  if (!cellsDirty || !board) return;
+  cellsDirty = false;
+  for (const b of cellBuckets.values()) b.count = 0;
+  let L = 0;
+  for (const k in cellMesh) {
+    const c = cellMesh[k], b = cellBucket(c.mat);
+    _cp.set(c.x, c.py, c.z); _cs.set(1, c.sy, 1);
+    b.setMatrixAt(b.count++, _cm.compose(_cp, UNIT_Q, _cs));
+    if (c.product) {
+      const i = atlas.index.get(c.product), col = i % atlas.cols, row = Math.floor(i / atlas.cols);
+      _cp.set(c.x, topY(c.sy) + 0.002, c.z); _cs.set(1, 1, 1);
+      labelMesh.setMatrixAt(L, _cm.compose(_cp, UNIT_Q, _cs));
+      labelAttr.setXY(L, col / atlas.cols, 1 - (row + 1) / atlas.rows);
+      L++;
+    }
+  }
+  for (const b of cellBuckets.values()) { b.instanceMatrix.needsUpdate = true; b.visible = b.count > 0; }
+  labelMesh.count = L; labelMesh.visible = L > 0;
+  labelMesh.instanceMatrix.needsUpdate = true; labelAttr.needsUpdate = true;
 }
 
 // ---------- syncing the board from S (section 4) ----------
@@ -386,13 +465,9 @@ function syncScene(S) {
     if (showTarget && k === targetKey) { mat = creeper ? matCreeper : matTarget; sy = 6; }
     const cell = cellMesh[k];
     cell.material = mat; if (!scaleLock.has(k)) cell.scale.y = sy;
-    if (owner != null) {
-      const lb = productLabel(k);
-      lb.setText(r * c);
-      lb.position.set(cellX(c), topY(sy) + 0.012, cellZ(r));
-      lb.visible = true;
-    } else if (labelFor[k]) labelFor[k].visible = false;
+    cell.product = owner != null ? r * c : 0;          // product label, drawn from the atlas by flushCells()
   }
+  cellsDirty = true;
 
   // ore gems (found ones, plus the target while it is an ore cell) and the target marker
   const gemWant = new Set(oreFound);
@@ -426,8 +501,7 @@ function syncScene(S) {
   updateDisplay();
 
   fxSync(S);                                          // section 6: effects, each guarded by its own vr* variable
-  // section 7 hook: opponent marker and solo face (driven by Z.onPose in frame())
-  // section 9 hook: seated toggle and EXIT tile (register with addTile)
+  // section 7 (opponent marker, solo face) and section 9 (seated, EXIT) are per-frame / tile-driven, see presenceUpdater
 }
 
 // ---------- tweens, per-frame updaters, panel mirror ----------
@@ -470,8 +544,9 @@ function updateHand(s) {
     if (!f.inside || f.dz < -0.03 || f.dz > 0.05) continue;
     if (!bf || Math.abs(f.dz) < Math.abs(bf.dz)) { best = t; bf = f; }
   }
-  if (s.pressed) { const f = faceDist(s.pressed, v3); if (!f.inside || f.dz > 0.03) s.pressed = null; }
-  else if (best && bf.dz < 0.015) { s.pressed = best; press(best); }
+  if (s.pressed && !shown(s.pressed.obj)) s.pressed = null;          // tile hidden while held (numpad closed, say)
+  if (s.pressed) { const f = faceDist(s.pressed, v3); if (!f.inside || f.dz > 0.03) s.pressed = null; }   // released once the tip leaves
+  else if (best && bf.dz < 0.015) { s.pressed = best; press(best); }  // pressed within 1.5 cm of the front face
   s.hover = s.pressed || best;
 }
 
@@ -745,15 +820,132 @@ function fxUpdater(now, dt) {
   pMesh.instanceMatrix.needsUpdate = true;
 }
 
+// ---------- opponent presence and solo face (section 7) ----------
+// Coordinates arrive in the sender's local-floor space, where the sender stands at the origin facing -z. We stand at the
+// origin too, so the opponent maps to a point at z = -2.2 facing us: a 180 degree turn about the vertical axis through
+// the board centre (x -> -x, z -> -2.2 - z), and the head quaternion is turned the same way.
+const POSE_EVERY = 100, POSE_STALE = 3000, POSE_FADE = 0.3;
+const MIRROR_Z = -2.2, FACE_POS = new THREE.Vector3(0, 2.3, -2.2);   // above the dialogue panel (top at y 2.0)
+const FACE_BY_CPU = { Dummy: '•_•', Robot: '[o_o]', Boss: '[>_<]' };  // S.names[1] in solo is the CPU's name (difficulty)
+const _pq = new THREE.Quaternion(), _pv = new THREE.Vector3(), _pe = new THREE.Vector3(), _hv = new THREE.Vector3();
+let presenceAcc = 0, poseTgt = null, poseAt = 0;
+let marker = null, heartMesh = null, heartMat = null, handMat = null, handMeshes = [], handLive = [false, false], markerLive = false;
+let faceMesh = null, faceMat = null, faceGeo = null, faceText = '', faceTilt = [0, 0];
+function heartGeo() {                                 // extruded heart, 10 cm wide and 1 cm deep, facing +z
+  const pts = [], k = 0.1 / 32;
+  for (let i = 0; i < 64; i++) {
+    const t = i / 64 * Math.PI * 2;
+    const x = 16 * Math.pow(Math.sin(t), 3), y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+    pts.push(new THREE.Vector2(x * k, (y + 2.5) * k));  // the curve spans y -17..12, so +2.5 centres it
+  }
+  const g = new THREE.ExtrudeGeometry(new THREE.Shape(pts), { depth: 0.01, bevelEnabled: false, curveSegments: 1 });
+  g.translate(0, 0, -0.005);
+  return g;
+}
+function buildPresence() {
+  heartMat = own(new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, depthWrite: false }));
+  handMat = own(new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, depthWrite: false }));
+  marker = new THREE.Group(); marker.visible = false; scene.add(marker);
+  heartMesh = new THREE.Mesh(own(heartGeo()), heartMat); marker.add(heartMesh);
+  const handGeo = own(new THREE.SphereGeometry(0.02, 8, 6));       // 4 cm across
+  handMeshes = [0, 1].map(() => { const m = new THREE.Mesh(handGeo, handMat); m.visible = false; scene.add(m); return m; });
+  faceMat = own(new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false }));
+  faceGeo = own(new THREE.PlaneGeometry(1, 1));
+  faceMesh = new THREE.Mesh(faceGeo, faceMat); faceMesh.position.copy(FACE_POS); faceMesh.visible = false; scene.add(faceMesh);
+  faceText = ''; setFace('•_•');
+}
+function setFace(t) {
+  if (t === faceText) return;
+  faceText = t;
+  const tex = textTexture(t, { font: '150px "VT323", monospace', color: '#ffffff', pad: 12, maxW: 0, lh: 150 });
+  faceMat.map = tex; faceMat.needsUpdate = true;
+  const w = tex.userData.w * MM * 1.6, h = tex.userData.h * MM * 1.6, f = Math.min(1, 0.6 / w, 0.4 / h);
+  faceMesh.scale.set(w * f, h * f, 1);
+}
+function readPose(p) {                                // validates the wire format {h:[x,y,z,qx,qy,qz,qw], l, r}
+  if (!p || !Array.isArray(p.h) || p.h.length < 7) return null;
+  const h = p.h.slice(0, 7).map(Number);
+  if (h.some(v => !Number.isFinite(v))) return null;
+  const hand = a => Array.isArray(a) && a.length === 3 && a.every(Number.isFinite) ? a : null;
+  return { h, hands: [hand(p.l), hand(p.r)] };
+}
+function mirrorPose(p) {                              // sender space -> our space, precomputed on arrival
+  const h = p.h, mv = a => new THREE.Vector3(-a[0], a[1], MIRROR_Z - a[2]);
+  // pi-turn about y applied to the orientation: (qx, qy, qz, qw) -> (qz, qw, -qx, -qy)
+  return { pos: mv(h), quat: new THREE.Quaternion(h[5], h[6], -h[3], -h[4]), hands: p.hands.map(a => a ? mv(a) : null) };
+}
+function handPoint(i) {                               // wrist of a tracked hand, else the controller, else null
+  const hand = renderer.xr.getHand(i), wr = hand && hand.joints && hand.joints.wrist;
+  let o = wr && wr.visible ? wr : null;
+  if (!o) { const ctrl = renderer.xr.getController(i); o = ctrl && ctrl.visible ? ctrl : null; }
+  if (!o) return null;
+  o.getWorldPosition(_hv);
+  return [_hv.x, _hv.y, _hv.z];
+}
+function localPose() {
+  // XR: the ArrayCamera's matrixWorld is the head pose (set by WebXRManager). Desktop: the fixed camera stands in for it.
+  let cam = renderer.xr.getCamera();
+  if (desk) { camera.updateMatrixWorld(); cam = camera; }     // the desktop camera is not in the scene graph
+  cam.matrixWorld.decompose(_pv, _pq, _pe);
+  const hands = desk ? [null, null] : [handPoint(0), handPoint(1)];   // l = hand/controller 0, r = 1
+  return { h: [_pv.x, _pv.y, _pv.z, _pq.x, _pq.y, _pq.z, _pq.w], l: hands[0], r: hands[1] };
+}
+// Per frame: send the pose every 100 ms, and derive the marker and face from the current mode and seats.
+function presenceUpdater(now, dt) {
+  presenceAcc += dt * 1000;
+  if (presenceAcc >= POSE_EVERY) {
+    presenceAcc %= POSE_EVERY;
+    if (Z.mode === 'host' || Z.mode === 'guest') Z.sendPose(localPose());   // the bridge drops it when no peer is open
+  }
+  const st = Z.state, opp = Z.mySlot === 0 ? 1 : 0;
+  const inP2P = (Z.mode === 'host' || Z.mode === 'guest') && Z.mySlot >= 0 && !!st && !!st.seats && !!st.seats[opp];
+  const want = inP2P && !!poseTgt;
+  const k = 1 - Math.pow(0.8, dt * 60);               // lerp factor 0.2 per 1/60 s, frame-rate independent
+  if (want) {
+    const col = matP[opp].emissive;
+    heartMat.color.copy(col); handMat.color.copy(col);
+    if (!markerLive) { marker.position.copy(poseTgt.pos); marker.quaternion.copy(poseTgt.quat); markerLive = true; }
+    marker.position.lerp(poseTgt.pos, k); marker.quaternion.slerp(poseTgt.quat, k);
+  } else markerLive = false;
+  marker.visible = want;
+  const op = want && now - poseAt > POSE_STALE ? POSE_FADE : 1;   // 30 % after 3 s without a pose
+  heartMat.opacity = op; handMat.opacity = op;
+  for (let i = 0; i < 2; i++) {
+    const hp = want ? poseTgt.hands[i] : null, m = handMeshes[i];
+    m.visible = !!hp;
+    if (!hp) { handLive[i] = false; continue; }
+    if (!handLive[i]) { m.position.copy(hp); handLive[i] = true; }
+    m.position.lerp(hp, k);
+  }
+  // solo face: the CPU, with its expression for the difficulty, bobs and leans toward its target while it answers
+  const solo = Z.mode === 'solo' && !!st;
+  faceMesh.visible = solo;
+  if (solo) {
+    setFace(FACE_BY_CPU[st.names && st.names[1]] || FACE_BY_CPU.Dummy);
+    faceMesh.position.set(FACE_POS.x, FACE_POS.y + 0.02 * Math.sin(now / 1000 * Math.PI), FACE_POS.z);   // +-2 cm, 2 s period
+    let tx = 0, ty = 0;
+    if (st.phase === 'answer' && st.turn === 1 && st.roll) {
+      const dx = cellX(st.roll.c) - FACE_POS.x, dy = topY(1) - FACE_POS.y, dz = cellZ(st.roll.r) - FACE_POS.z;
+      ty = 0.5 * Math.atan2(dx, dz); tx = 0.5 * Math.atan2(-dy, dz);
+    }
+    const kf = 1 - Math.pow(0.85, dt * 60);
+    faceTilt[0] += (tx - faceTilt[0]) * kf; faceTilt[1] += (ty - faceTilt[1]) * kf;
+    faceMesh.rotation.set(faceTilt[0], faceTilt[1], 0);
+  }
+}
+
 // ---------- frame loop ----------
 function frame() {
+  if (!renderer) return;
   const now = performance.now();
   const dt = Math.min(0.1, (now - lastT) / 1000) || 0;
   lastT = now;
   scene.updateMatrixWorld();
   for (const fn of updaters) fn(now, dt);
+  if (!renderer) return;                              // an updater may have ended the session (EXIT in desktop mode)
   // section 6 / 7 / 9 updaters register into `updaters` in their own build step
   paintTiles();
+  flushCells();
   renderer.render(scene, camera);
 }
 
@@ -817,8 +1009,24 @@ function attachDesk() {
   onResize();
 }
 
+// ---------- seated mode and EXIT (section 9) ----------
+function readSeated() { try { return localStorage.getItem(SEAT_KEY) === '1'; } catch (_) { return false; } }
+function writeSeated(on) { try { localStorage.setItem(SEAT_KEY, on ? '1' : '0'); } catch (_) {} }
+function applySeated(on) {
+  seated = on;
+  lift.position.y = on ? -SEAT_DROP : 0;
+  if (seatTile) seatTile.label.setText(on ? 'STAND UP' : 'SIT DOWN');
+}
+function toggleSeated() { applySeated(!seated); writeSeated(seated); }
+// XR: end the session; the 'end' listener tears down. Desktop: tear down directly.
+function exitVR() {
+  if (desk || !session) { teardown(); return; }
+  session.end().catch(() => teardown());
+}
+
 // ---------- lifecycle ----------
 function disposeObject(o) {
+  if (o.isInstancedMesh) o.dispose();                 // frees the instance matrix / colour buffers (they are not geometry)
   if (o.geometry) o.geometry.dispose();
   const ms = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
   for (const m of ms) { if (m.map) m.map.dispose(); m.dispose(); }
@@ -836,13 +1044,17 @@ function teardown() {
   if (renderer) { try { renderer.dispose(); renderer.forceContextLoss(); } catch (_) {} }
   renderer = scene = camera = session = canvas = board = null;
   for (const k in cellMesh) delete cellMesh[k];
-  for (const k in labelFor) delete labelFor[k];
   for (const k in gemFor) delete gemFor[k];
   tiles.length = 0; sources.length = 0; hpBars = [];
   tileGeo = edgeGeo = cellGeo = gemGeo = lineMat = null;
   matFree = matCrater = matTarget = matCreeper = matGem = null; matP = [];
   rowBar = colBar = flash = targetLabel = glowTex = null;
   panel = roomLabel = pad = padDisplay = fightTile = againTile = null;
+  cellBuckets.clear(); cellsDirty = true; labelMesh = labelAttr = atlas = null;
+  lift = seatTile = exitTile = null; seated = false;
+  marker = heartMesh = heartMat = handMat = faceMesh = faceMat = faceGeo = null;
+  handMeshes = []; handLive = [false, false]; markerLive = false;
+  poseTgt = null; poseAt = 0; presenceAcc = 0; faceText = ''; faceTilt = [0, 0];
   msgEl = codeBoxEl = codeEl = null;
   panelText = roomText = null; lastP = ['', ''];
   typed = ''; typedN = -1; vrShownN = 0; vrRolling = false; rollKey = null;
@@ -885,8 +1097,12 @@ export async function start(Z_) {
     updaters.add(tweenUpdater);
     updaters.add(pointUpdater);
     updaters.add(fxUpdater);
+    updaters.add(presenceUpdater);
     unsubState = Z.onState(syncScene);
     cleanup.push(() => { if (unsubState) unsubState(); });
+    // Z.onPose holds one listener; teardown puts a no-op back (cleanup runs before Z is cleared)
+    Z.onPose(p => { const r = readPose(p); if (!r) return; poseTgt = mirrorPose(r); poseAt = performance.now(); });
+    cleanup.push(() => Z.onPose(() => {}));
 
     if (desk) {
       attachDesk();
@@ -905,6 +1121,22 @@ export async function start(Z_) {
       get rolling() { return vrRolling; }, get typed() { return typed; },
       get desk() { return desk; }, get active() { return active; },
       get fx() { return fxDrops.size + pLive; },        // live effect objects (for leak checks)
+      get lowered() { return lift ? lift.position.y : null; }, get seated() { return seated; },
+      // screen position (CSS px) of a pressable tile by key, for desktop tests
+      screenOf: key => {
+        const t = tiles.find(x => x.key === key && shown(x.obj));
+        if (!t || !camera) return null;
+        const v = t.obj.getWorldPosition(new THREE.Vector3()).project(camera);
+        return { x: (v.x + 1) / 2 * innerWidth, y: (1 - v.y) / 2 * innerHeight };
+      },
+      presence: () => ({ marker: !!marker && marker.visible, pos: marker ? marker.position.toArray().map(v => +v.toFixed(3)) : null,
+        quat: marker ? marker.quaternion.toArray().map(v => +v.toFixed(3)) : null,
+        opacity: heartMat ? heartMat.opacity : null, color: heartMat ? heartMat.color.getHexString() : null,
+        hands: handMeshes.map(m => m.visible), handPos: handMeshes.map(m => m.visible ? m.position.toArray().map(v => +v.toFixed(3)) : null) }),
+      face: () => ({ visible: !!faceMesh && faceMesh.visible, text: faceText, y: faceMesh ? +faceMesh.position.y.toFixed(3) : null,
+        tilt: faceTilt.map(v => +v.toFixed(3)) }),
+      cells: () => ({ buckets: [...cellBuckets.values()].map(b => b.count), labels: labelMesh ? labelMesh.count : 0 }),
+      info: () => renderer ? { calls: renderer.info.render.calls, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures } : null,
       end: () => teardown()
     };
   } catch (e) {
