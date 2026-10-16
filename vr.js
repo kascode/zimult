@@ -15,6 +15,7 @@ const TILT = -Math.PI / 6;                          // control panels lean 30 de
 const DIGITS = /^[0-9]$/;
 const KEY_MAP = { Backspace: '⌫', Enter: '↵' };   // backspace / return glyphs used on the numpad
 const FALLBACK_P = ['#c8551d', '#1f7a8c'];         // Classic skin hero colours, used when --p1/--p2 are unset
+const ROUND_D = 0.03, ROUND_Z = 0.03;               // round console buttons: thickness, and their z in the dash group (section 2)
 
 // ---------- module state (everything here is reset by teardown) ----------
 let active = false, tearingDown = false, sessionEnded = false, runGen = 0;
@@ -25,6 +26,7 @@ const cellMesh = {}, gemFor = {};                   // 'r-c' -> CellProxy (cell,
 const SEAT_KEY = 'ttd-vr-seated', SEAT_DROP = 0.35;  // section 9: seated mode lowers the board, numpad and tiles by this much
 let seated = false, lift = null, seatTile = null, exitTile = null;
 let tileGeo = null, edgeGeo = null, cellGeo = null, gemGeo = null, lineMat = null;
+let roundGeo = null, ringMat = null, rollDepress = null;   // round tiles (section 2); rollDepress = cancel of the ROLL press tween
 let matFree = null, matCrater = null, matTarget = null, matCreeper = null, matGem = null, matP = [];
 let rowBar = null, colBar = null, flash = null, glowTex = null;
 let card = null, cardGrp = null, cardText = null, cardBase = '', post = null;   // question card above the target cell (section 1)
@@ -152,6 +154,25 @@ function addTile({ parent, x = 0, y = 0, z = 0, rotX = 0, w, h, label, font = FO
   tiles.push(tile);
   return tile;
 }
+// Round pressable (section 2): black cylinder with a white ring. The mesh is a unit cylinder scaled to (2r, 2r, ROUND_D),
+// so faceDz and paintTiles work as for addTile; tile.d carries the thickness. The ring and label sit proud of the face.
+function addRoundTile({ parent, x = 0, y = 0, z = 0, r, label, font = FONT_LABEL, k = 1, box = null, onPress, key }) {
+  const grp = new THREE.Group();
+  grp.position.set(x, y, z);
+  const mat = own(new THREE.MeshStandardMaterial({ color: 0x000000, roughness: 0.7 }));
+  const mesh = new THREE.Mesh(roundGeo, mat);
+  mesh.scale.set(2 * r, 2 * r, ROUND_D);
+  const ring = new THREE.Mesh(own(new THREE.RingGeometry(r * 0.86, r, 32)), ringMat);
+  ring.position.z = ROUND_D / 2 + 0.001;
+  const text = makeText(label, { font, k, box });
+  text.position.set(0, 0, ROUND_D / 2 + 0.002);
+  grp.add(mesh, ring, text);
+  parent.add(grp);
+  const tile = { obj: grp, mesh, mat, w: 2 * r, h: 2 * r, d: ROUND_D, label: text, onPress, shade: -1, key: key || label };
+  mesh.userData.tile = tile;
+  tiles.push(tile);
+  return tile;
+}
 function paintTiles() {
   for (const t of tiles) {
     let shade = 0;
@@ -170,7 +191,7 @@ function pick() {
 // Distance from a world point to a tile's front face, in metres (> 0 is in front of the face); NaN when off the tile.
 function faceDz(t, p) {
   v3b.copy(p); t.mesh.worldToLocal(v3b);               // mesh geometry is a unit box scaled to (w, h, 0.02)
-  return Math.abs(v3b.x * t.w) <= t.w / 2 + 0.01 && Math.abs(v3b.y * t.h) <= t.h / 2 + 0.01 ? (v3b.z - 0.5) * 0.02 : NaN;
+  return Math.abs(v3b.x * t.w) <= t.w / 2 + 0.01 && Math.abs(v3b.y * t.h) <= t.h / 2 + 0.01 ? (v3b.z - 0.5) * (t.d || 0.02) : NaN;
 }
 function press(t) {
   if (!t || !t.onPress) return;
@@ -212,6 +233,14 @@ function submit() {
 }
 function roll() { if (fightTile && fightTile.obj.visible) Z.dispatch({ type: 'roll' }); }
 function again() { if (againTile && againTile.obj.visible) Z.dispatch({ type: 'reset' }); }
+function depressRoll() {                                // 120 ms: ROLL sinks 1.2 cm and springs back
+  if (!fightTile || !fightTile.obj.visible) return;
+  const obj = fightTile.obj;
+  if (rollDepress) { rollDepress(); obj.position.z = ROUND_Z; }
+  rollDepress = animate(120, p => { obj.position.z = ROUND_Z - 0.012 * Math.sin(Math.PI * p); },
+    () => { obj.position.z = ROUND_Z; rollDepress = null; });
+}
+function rollPress() { depressRoll(); roll(); }
 
 // ---------- scene building ----------
 function paintHeroColours() {
@@ -253,6 +282,8 @@ function build() {
   lineMat = own(new THREE.LineBasicMaterial({ color: 0xffffff }));
   tileGeo = own(new THREE.BoxGeometry(1, 1, 1));
   edgeGeo = own(new THREE.EdgesGeometry(tileGeo));
+  roundGeo = own(new THREE.CylinderGeometry(0.5, 0.5, 1, 32)); roundGeo.rotateX(Math.PI / 2);   // unit disc, axis along z
+  ringMat = own(new THREE.MeshBasicMaterial({ color: 0xffffff }));
   cellGeo = own(new THREE.BoxGeometry(CELL, 0.02, CELL));
   gemGeo = own(new THREE.OctahedronGeometry(0.02));
   matGem = own(new THREE.MeshStandardMaterial({ color: 0x4dd0e1, emissive: 0x1b6a75 }));
@@ -370,32 +401,48 @@ function build() {
     return { name, fill };
   });
 
-  // dashboard (section 5): one console attached to the front of the pedestal, leaning back toward the player.
-  // Left: ROLL / PLAY AGAIN. Centre: question display + numpad. Right: EXIT, SIT DOWN. Everything is a child of the
-  // dash group, so it tilts, lowers (seated) and shakes with the board as one object.
+  // dashboard (section 2): arcade console on the front of the pedestal, leaning back toward the player. Same group,
+  // position and tilt as before. Left: ROLL / PLAY AGAIN. Centre: marquee, yellow screen, numpad. Right: EXIT, SIT / STAND.
+  // Everything is a child of the dash group, so it tilts, lowers (seated) and shakes with the board as one object.
   const DASH_TILT = -0.62;                                                    // ~35 degrees, face points up at standing eye height
-  dash = new THREE.Group(); dash.position.set(0, 0.80, -0.30); dash.rotation.x = DASH_TILT; lift.add(dash);
-  const dashPlate = new THREE.Mesh(own(new THREE.BoxGeometry(0.96, 0.38, 0.02)), own(new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 0.9 })));
-  dashPlate.add(new THREE.LineSegments(own(new THREE.EdgesGeometry(dashPlate.geometry)), lineMat));
-  dash.add(dashPlate);
-  const DZ = 0.022;                                                           // tiles sit proud of the plate
-  // centre: numpad + display (the pad group is what gets shown/hidden while answering)
-  pad = new THREE.Group(); pad.position.set(0.03, -0.03, DZ); dash.add(pad);
+  dash = new THREE.Group(); dash.position.set(0, 0.72, -0.30); dash.rotation.x = DASH_TILT; lift.add(dash);
+  // cabinet body: trapezoid, front face at z = 0, 3 cm deep; a white bezel rail along the top carries the marquee
+  const DASH_H = 0.25;                                                        // half height: the numpad and screen need it
+  const bodyGeo = own(new THREE.ExtrudeGeometry(new THREE.Shape([
+    new THREE.Vector2(-0.50, -DASH_H), new THREE.Vector2(0.50, -DASH_H), new THREE.Vector2(0.44, DASH_H), new THREE.Vector2(-0.44, DASH_H)
+  ]), { depth: 0.03, bevelEnabled: false }));
+  bodyGeo.translate(0, 0, -0.03);
+  const body = new THREE.Mesh(bodyGeo, own(new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 0.9 })));
+  body.add(new THREE.LineSegments(own(new THREE.EdgesGeometry(bodyGeo)), lineMat));
+  dash.add(body);
+  const rail = new THREE.Mesh(own(new THREE.BoxGeometry(0.88, 0.02, 0.012)), white);
+  rail.position.set(0, DASH_H - 0.02, 0.006); dash.add(rail);
+  const marquee = makeText('ZIMULT', { font: FONT_LABEL, k: 0.4, color: '#000000' });   // decorative, black on the white rail
+  marquee.position.set(0, DASH_H - 0.02, 0.014); dash.add(marquee);
+  // centre: numpad and screen (the pad group is what gets shown/hidden while answering)
+  const PAD_PITCH = 0.082;
+  pad = new THREE.Group(); pad.position.set(0.04, -0.04, 0.012); dash.add(pad);
   const keys = [['7', '8', '9'], ['4', '5', '6'], ['1', '2', '3'], [KEY_MAP.Backspace, '0', KEY_MAP.Enter]];
   for (let row = 0; row < 4; row++) for (let col = 0; col < 3; col++) {
     const label = keys[row][col];
-    addTile({ parent: pad, x: (col - 1) * 0.074, y: (1.5 - row) * 0.074 - 0.012, w: 0.066, h: 0.066, label, k: 0.9, onPress: () => keyPress(label) });
+    addTile({ parent: pad, x: (col - 1) * PAD_PITCH, y: (1.5 - row) * PAD_PITCH - 0.012, w: 0.075, h: 0.075, label, font: FONT_LABEL, k: 1.0, onPress: () => keyPress(label) });
   }
-  padDisplay = makeText('____', { font: FONT_LABEL, k: 0.9, color: '#ffd800', box: [0.44, 0.06] });
-  padDisplay.position.set(0, 0.16, 0.002); pad.add(padDisplay);
-  // left: ROLL while it is your turn, PLAY AGAIN when the match is over (same spot)
-  fightTile = addTile({ parent: dash, x: -0.33, y: 0.0, z: DZ, w: 0.24, h: 0.13, label: 'ROLL', font: FONT_LABEL, k: 0.9, key: 'fight', onPress: roll });
+  // screen: black panel with a 3 mm white border; padDisplay is its text
+  const SCR_Y = 0.20, SCR_W = 0.42, SCR_H = 0.06;                             // pad-local
+  const scrFrame = new THREE.Mesh(own(new THREE.PlaneGeometry(SCR_W + 0.006, SCR_H + 0.006)), white);
+  scrFrame.position.set(0, SCR_Y, 0); pad.add(scrFrame);
+  const scrBlack = new THREE.Mesh(own(new THREE.PlaneGeometry(SCR_W, SCR_H)), black);
+  scrBlack.position.set(0, SCR_Y, 0.001); pad.add(scrBlack);
+  padDisplay = makeText('____', { font: FONT_PANEL, k: 0.8, color: '#ffd800', box: [SCR_W - 0.02, SCR_H] });
+  padDisplay.position.set(0, SCR_Y, 0.002); pad.add(padDisplay);
+  // left: ROLL while it is your turn, PLAY AGAIN when the match is over (same spot, both round)
+  fightTile = addRoundTile({ parent: dash, x: -0.30, y: 0, z: ROUND_Z, r: 0.085, label: 'ROLL', font: FONT_LABEL, k: 1.0, box: [0.14, 0.06], key: 'fight', onPress: rollPress });
   fightTile.obj.visible = false;
-  againTile = addTile({ parent: dash, x: -0.33, y: 0.0, z: DZ, w: 0.24, h: 0.13, label: 'PLAY AGAIN', font: FONT_LABEL, k: 0.6, key: 'again', onPress: again });
+  againTile = addRoundTile({ parent: dash, x: -0.30, y: 0, z: ROUND_Z, r: 0.085, label: 'PLAY AGAIN', font: FONT_LABEL, k: 0.6, box: [0.14, 0.05], key: 'again', onPress: again });
   againTile.obj.visible = false;
-  // right: EXIT and SIT DOWN / STAND UP (section 9)
-  exitTile = addTile({ parent: dash, x: 0.35, y: 0.08, z: DZ, w: 0.2, h: 0.08, label: 'EXIT', font: FONT_LABEL, k: 0.7, key: 'exit', onPress: exitVR });
-  seatTile = addTile({ parent: dash, x: 0.35, y: -0.05, z: DZ, w: 0.2, h: 0.08, label: 'SIT DOWN', font: FONT_LABEL, k: 0.55, key: 'seat', onPress: toggleSeated });
+  // right: small round EXIT and SIT / STAND (section 9)
+  exitTile = addRoundTile({ parent: dash, x: 0.37, y: 0.09, z: ROUND_Z, r: 0.035, label: 'EXIT', font: FONT_TILE, k: 0.8, box: [0.058, 0.032], key: 'exit', onPress: exitVR });
+  seatTile = addRoundTile({ parent: dash, x: 0.37, y: -0.05, z: ROUND_Z, r: 0.035, label: 'SIT', font: FONT_TILE, k: 0.8, box: [0.058, 0.032], key: 'seat', onPress: toggleSeated });
   applySeated(readSeated());
 
   msgEl = document.getElementById('msg');
@@ -1086,7 +1133,7 @@ function attachDesk() {
     if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); teardown(); return; }
     let handled = true;
     if (DIGITS.test(e.key) || e.key in KEY_MAP) keyPress(KEY_MAP[e.key] || e.key);
-    else if (e.key === 'r' || e.key === 'R') roll();
+    else if (e.key === 'r' || e.key === 'R') rollPress();
     else handled = false;
     if (handled) { e.preventDefault(); e.stopPropagation(); }   // capture phase: keys belong to VR, not the hidden 2D input
   };
@@ -1110,7 +1157,7 @@ function writeSeated(on) { try { localStorage.setItem(SEAT_KEY, on ? '1' : '0');
 function applySeated(on) {
   seated = on;
   lift.position.y = on ? -SEAT_DROP : 0;
-  if (seatTile) seatTile.label.setText(on ? 'STAND UP' : 'SIT DOWN');
+  if (seatTile) seatTile.label.setText(on ? 'STAND' : 'SIT');
 }
 function toggleSeated() { applySeated(!seated); writeSeated(seated); }
 // XR: end the session; the 'end' listener tears down. Desktop: tear down directly.
@@ -1142,6 +1189,7 @@ function teardown() {
   for (const k in gemFor) delete gemFor[k];
   tiles.length = 0; sources.length = 0; hpBars = [];
   tileGeo = edgeGeo = cellGeo = gemGeo = lineMat = null;
+  roundGeo = ringMat = null; rollDepress = null;
   matFree = matCrater = matTarget = matCreeper = matGem = null; matP = [];
   rowBar = colBar = flash = glowTex = null;
   card = cardGrp = cardText = post = null; cardBase = '';
