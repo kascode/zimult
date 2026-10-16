@@ -28,7 +28,7 @@ let tileGeo = null, edgeGeo = null, cellGeo = null, gemGeo = null, lineMat = nul
 let matFree = null, matCrater = null, matTarget = null, matCreeper = null, matGem = null, matP = [];
 let rowBar = null, colBar = null, flash = null, targetLabel = null, glowTex = null;
 let panel = null, roomLabel = null, hpBars = [];
-let pad = null, padDisplay = null, fightTile = null, againTile = null;
+let pad = null, padDisplay = null, fightTile = null, againTile = null, dash = null;
 let msgEl = null, codeBoxEl = null, codeEl = null;
 let panelText = null, roomText = null, lastP = ['', ''];
 let typed = '', typedN = -1;
@@ -327,28 +327,32 @@ function build() {
     return { name, fill };
   });
 
-  // numpad (group at (0.75, 1.15, -0.35), tilted: right of the board and nearer the player, so it never hides columns 9-10),
-  // its display, FIGHT under it, PLAY AGAIN mirrored on the left
-  pad = new THREE.Group(); pad.position.set(0.75, 1.15, -0.35); pad.rotation.x = TILT; lift.add(pad);
-  const backing = new THREE.Mesh(own(new THREE.PlaneGeometry(0.3, 0.5)), own(new THREE.MeshBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.85 })));
-  backing.position.set(0, 0.02, -0.01); pad.add(backing);
+  // dashboard (section 5): one console attached to the front of the pedestal, leaning back toward the player.
+  // Left: ROLL / PLAY AGAIN. Centre: question display + numpad. Right: EXIT, SIT DOWN. Everything is a child of the
+  // dash group, so it tilts, lowers (seated) and shakes with the board as one object.
+  const DASH_TILT = -0.62;                                                    // ~35 degrees, face points up at standing eye height
+  dash = new THREE.Group(); dash.position.set(0, 0.80, -0.30); dash.rotation.x = DASH_TILT; lift.add(dash);
+  const dashPlate = new THREE.Mesh(own(new THREE.BoxGeometry(0.96, 0.38, 0.02)), own(new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 0.9 })));
+  dashPlate.add(new THREE.LineSegments(own(new THREE.EdgesGeometry(dashPlate.geometry)), lineMat));
+  dash.add(dashPlate);
+  const DZ = 0.022;                                                           // tiles sit proud of the plate
+  // centre: numpad + display (the pad group is what gets shown/hidden while answering)
+  pad = new THREE.Group(); pad.position.set(0.03, -0.03, DZ); dash.add(pad);
   const keys = [['7', '8', '9'], ['4', '5', '6'], ['1', '2', '3'], [KEY_MAP.Backspace, '0', KEY_MAP.Enter]];
   for (let row = 0; row < 4; row++) for (let col = 0; col < 3; col++) {
     const label = keys[row][col];
-    addTile({ parent: pad, x: (col - 1) * 0.09, y: (1.5 - row) * 0.09, w: 0.08, h: 0.08, label, onPress: () => keyPress(label) });
+    addTile({ parent: pad, x: (col - 1) * 0.074, y: (1.5 - row) * 0.074 - 0.012, w: 0.066, h: 0.066, label, k: 0.9, onPress: () => keyPress(label) });
   }
-  padDisplay = makeText('____', { font: FONT_LABEL, k: 0.8, color: '#ffd800', box: [0.3, 0.06] });
-  padDisplay.position.set(0, 0.235, 0.01); padDisplay.renderOrder = 1; pad.add(padDisplay);   // draw after the translucent backing
-  pad.updateMatrixWorld(true);
-  const fightAt = pad.localToWorld(new THREE.Vector3(0, -0.27, 0));
-  fightTile = addTile({ parent: lift, x: fightAt.x, y: fightAt.y, z: fightAt.z, rotX: TILT, w: 0.3, h: 0.1, label: 'FIGHT', font: FONT_LABEL, k: 0.6, key: 'fight', onPress: roll });
+  padDisplay = makeText('____', { font: FONT_LABEL, k: 0.9, color: '#ffd800', box: [0.44, 0.06] });
+  padDisplay.position.set(0, 0.16, 0.002); pad.add(padDisplay);
+  // left: ROLL while it is your turn, PLAY AGAIN when the match is over (same spot)
+  fightTile = addTile({ parent: dash, x: -0.33, y: 0.0, z: DZ, w: 0.24, h: 0.13, label: 'ROLL', font: FONT_LABEL, k: 0.9, key: 'fight', onPress: roll });
   fightTile.obj.visible = false;
-  againTile = addTile({ parent: lift, x: -0.75, y: 1.2, z: -0.35, rotX: TILT, w: 0.6, h: 0.14, label: 'PLAY AGAIN', font: FONT_LABEL, k: 0.7, key: 'again', onPress: again });
+  againTile = addTile({ parent: dash, x: -0.33, y: 0.0, z: DZ, w: 0.24, h: 0.13, label: 'PLAY AGAIN', font: FONT_LABEL, k: 0.6, key: 'again', onPress: again });
   againTile.obj.visible = false;
-  // section 9: EXIT beside the numpad (always shown); SEATED on the pedestal front, so it moves with the board
-  const exitAt = pad.localToWorld(new THREE.Vector3(0.22, 0.135, 0));
-  exitTile = addTile({ parent: lift, x: exitAt.x, y: exitAt.y, z: exitAt.z, rotX: TILT, w: 0.1, h: 0.08, label: 'EXIT', font: FONT_LABEL, k: 0.6, key: 'exit', onPress: exitVR });
-  seatTile = addTile({ parent: board, x: 0, y: 0.6, z: -0.445, w: 0.42, h: 0.1, label: 'SIT DOWN', font: FONT_TILE, k: 0.9, key: 'seat', onPress: toggleSeated });   // 0.25 m above the floor once seated
+  // right: EXIT and SIT DOWN / STAND UP (section 9)
+  exitTile = addTile({ parent: dash, x: 0.35, y: 0.08, z: DZ, w: 0.2, h: 0.08, label: 'EXIT', font: FONT_LABEL, k: 0.7, key: 'exit', onPress: exitVR });
+  seatTile = addTile({ parent: dash, x: 0.35, y: -0.05, z: DZ, w: 0.2, h: 0.08, label: 'SIT DOWN', font: FONT_LABEL, k: 0.55, key: 'seat', onPress: toggleSeated });
   applySeated(readSeated());
 
   msgEl = document.getElementById('msg');
@@ -514,7 +518,7 @@ function syncScene(S) {
   pad.visible = mine && S.phase === 'answer' && !hold;
   fightTile.obj.visible = mine && S.phase === 'idle';
   againTile.obj.visible = over;
-  fightTile.label.setText(ut() ? 'FIGHT' : 'ROLL');
+  fightTile.label.setText('ROLL');
   againTile.label.setText(ut() ? 'MERCY' : 'PLAY AGAIN');
   updateDisplay();
 
@@ -1072,7 +1076,7 @@ function teardown() {
   tileGeo = edgeGeo = cellGeo = gemGeo = lineMat = null;
   matFree = matCrater = matTarget = matCreeper = matGem = null; matP = [];
   rowBar = colBar = flash = targetLabel = glowTex = null;
-  panel = roomLabel = pad = padDisplay = fightTile = againTile = null;
+  panel = roomLabel = pad = padDisplay = fightTile = againTile = dash = null;
   cellBuckets.clear(); cellsDirty = true; labelMesh = labelAttr = atlas = null;
   lift = seatTile = exitTile = null; seated = false;
   marker = heartMesh = heartMat = handMat = faceMesh = faceMat = faceGeo = null;
