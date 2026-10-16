@@ -26,7 +26,8 @@ const SEAT_KEY = 'ttd-vr-seated', SEAT_DROP = 0.35;  // section 9: seated mode l
 let seated = false, lift = null, seatTile = null, exitTile = null;
 let tileGeo = null, edgeGeo = null, cellGeo = null, gemGeo = null, lineMat = null;
 let matFree = null, matCrater = null, matTarget = null, matCreeper = null, matGem = null, matP = [];
-let rowBar = null, colBar = null, flash = null, targetLabel = null, glowTex = null;
+let rowBar = null, colBar = null, flash = null, glowTex = null;
+let card = null, cardGrp = null, cardText = null, cardBase = '', post = null;   // question card above the target cell (section 1)
 let panel = null, roomLabel = null, hpBars = [];
 let pad = null, padDisplay = null, fightTile = null, againTile = null, dash = null;
 let msgEl = null, codeBoxEl = null, codeEl = null;
@@ -169,7 +170,19 @@ function press(t) {
 }
 
 // ---------- numpad, FIGHT, PLAY AGAIN (section 5) ----------
+function updateCard() {                                 // card text: base question, plus typed digits while this screen is answering
+  if (!card || !card.visible || !cardText) return;
+  const typedPart = pad && pad.visible ? ' = ' + typed.padEnd(2, '_') : '';
+  cardText.setText(cardBase + typedPart);
+}
+function faceCard() {                                   // yaw only: the plate turns about Y to face the eye, never tilts in x or z
+  if (!card || !card.visible || !cardGrp) return;
+  card.getWorldPosition(_cardPos);
+  const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
+  cardGrp.rotation.y = Math.atan2(cam.position.x - _cardPos.x, cam.position.z - _cardPos.z);
+}
 function updateDisplay() {                              // the question itself: the 2D view shows it next to its input, not in #msg
+  updateCard();
   if (!padDisplay) return;
   const st = Z && Z.state, q = st && st.roll && st.phase === 'answer' ? st.roll.r + ' × ' + st.roll.c + ' = ' : '';
   padDisplay.setText(q + (typed ? typed.padEnd(4, '_') : '____'));
@@ -304,7 +317,27 @@ function build() {
   board.add(rowBar, colBar);
   flash = new THREE.Sprite(own(new THREE.SpriteMaterial({ map: glowTex, transparent: true, depthWrite: false })));
   flash.visible = false; board.add(flash);
-  targetLabel = makeText('?', { k: 1 }); targetLabel.visible = false; board.add(targetLabel);
+  // question card (section 1): built once, shown above the target cell. The post runs from the raised cell top to the
+  // pivot (the tail tip); cardGrp yaws toward the eye each frame (faceCard) and leans back a fixed 9 degrees.
+  const CARD_RISE = 0.16;                                             // pivot height above the raised (sy 6) cell top
+  const postGeo = own(new THREE.CylinderGeometry(0.003, 0.003, 1, 6));
+  const cardWhite = own(new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide }));
+  const cardBlack = own(new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide }));
+  card = new THREE.Group(); card.visible = false; board.add(card);
+  post = new THREE.Mesh(postGeo, cardWhite);
+  post.position.y = topY(6) + CARD_RISE / 2; post.scale.y = CARD_RISE; card.add(post);
+  cardGrp = new THREE.Group();
+  cardGrp.position.y = topY(6) + CARD_RISE; cardGrp.rotation.order = 'YXZ'; cardGrp.rotation.x = -0.15;
+  card.add(cardGrp);
+  const cardBorder = new THREE.Mesh(own(new THREE.PlaneGeometry(0.312, 0.132)), cardWhite);
+  cardBorder.position.y = 0.08; cardGrp.add(cardBorder);
+  const cardPlate = new THREE.Mesh(own(new THREE.PlaneGeometry(0.30, 0.12)), cardBlack);
+  cardPlate.position.set(0, 0.08, 0.001); cardGrp.add(cardPlate);
+  const tailGeo = own(new THREE.BufferGeometry());
+  tailGeo.setAttribute('position', new THREE.Float32BufferAttribute([-0.01, 0.012, 0, 0.01, 0.012, 0, 0, 0, 0], 3));
+  cardGrp.add(new THREE.Mesh(tailGeo, cardWhite));
+  cardText = makeText('', { font: FONT_PANEL, k: 1.3, color: '#ffffff', box: [0.28, 0.1] });
+  cardText.position.set(0, 0.08, 0.003); cardGrp.add(cardText);
 
   // dialogue panel mirrors #msg (section 3); room code sits above it while a P2P room is open
   const black = own(new THREE.MeshBasicMaterial({ color: 0x000000 })), white = own(new THREE.MeshBasicMaterial({ color: 0xffffff }));
@@ -501,12 +534,12 @@ function syncScene(S) {
     const g = gemOf(k);
     g.visible = true; g.position.set(cellX(c), topY(sy) + 0.06, cellZ(r));
   }
-  if (showTarget) {
+  if (showTarget) {                                   // question card: visible on every screen, typed digits only where typing
     const [r, c] = targetKey.split('-').map(Number);
-    targetLabel.setText((creeper ? '•_• ' : ore.includes(targetKey) ? '◆ ' : '') + r + '×' + c);
-    targetLabel.position.set(cellX(c), topY(6) + 0.012, cellZ(r));
-    targetLabel.visible = true;
-  } else targetLabel.visible = false;
+    cardBase = (creeper ? '•_• ' : ore.includes(targetKey) ? '◆ ' : '') + r + ' × ' + c;
+    card.position.set(cellX(c), 0, cellZ(r));
+    card.visible = true;
+  } else card.visible = false;
 
   updateHp(S);
 
@@ -550,6 +583,7 @@ function spinGems(now, dt) {
 }
 // Pointing: controllers cast along their own forward, hands use the index tip (both feed sources[]).
 const _rm = new THREE.Matrix4();
+const _cardPos = new THREE.Vector3();                // card world position for faceCard (reused, no per-frame allocation)
 function pointUpdater() {
   for (const s of sources) {
     if (s.obj) {                                        // three r160 has no Raycaster.setFromXRController
@@ -971,6 +1005,7 @@ function frame() {
   scene.updateMatrixWorld();
   for (const fn of updaters) fn(now, dt);
   if (!renderer) return;                              // an updater may have ended the session (EXIT in desktop mode)
+  faceCard();
   paintTiles();
   flushCells();
   renderer.render(scene, camera);
@@ -1075,7 +1110,8 @@ function teardown() {
   tiles.length = 0; sources.length = 0; hpBars = [];
   tileGeo = edgeGeo = cellGeo = gemGeo = lineMat = null;
   matFree = matCrater = matTarget = matCreeper = matGem = null; matP = [];
-  rowBar = colBar = flash = targetLabel = glowTex = null;
+  rowBar = colBar = flash = glowTex = null;
+  card = cardGrp = cardText = post = null; cardBase = '';
   panel = roomLabel = pad = padDisplay = fightTile = againTile = dash = null;
   cellBuckets.clear(); cellsDirty = true; labelMesh = labelAttr = atlas = null;
   lift = seatTile = exitTile = null; seated = false;
