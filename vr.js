@@ -34,6 +34,8 @@ let msgEl = null, codeBoxEl = null, codeEl = null;
 let panelText = null, roomText = null, lastP = ['', ''];
 let typed = '', typedN = -1;
 let vrShownN = 0, vrRolling = false, rollKey = null, rollToken = 0, rollTimer = 0, rollTween = null;
+let vrRiseN = 0, riseKey = null, riseCancel = null;   // section 3: round whose target rise has played; cell under the rise tween
+let rowHdr = null, colHdr = null;                     // header text quads by row / column index (1-based), lit with the target
 let unsubState = null, lastT = 0;
 const updaters = new Set();     // per-frame functions (now, dt). Later sections register here.
 const tweens = new Set();       // jobs {t0, ms, step, done} run by tweenUpdater
@@ -113,6 +115,13 @@ function makeText(text, opts = {}) {
     let sx = tex.userData.w * s, sy = tex.userData.h * s;
     if (o.box) { const f = Math.min(1, o.box[0] / sx, o.box[1] / sy); sx *= f; sy *= f; }
     sp.scale.set(sx, sy, 1);
+    return sp;
+  };
+  // recolour: re-renders the same text in the new colour (the texture cache is keyed by colour)
+  sp.setColor = c => {
+    if (c === o.color) return sp;
+    o.color = c;
+    const t = cur; cur = null; sp.setText(t);
     return sp;
   };
   sp.setText(text);
@@ -299,13 +308,14 @@ function build() {
   labelMesh.count = 0; labelMesh.visible = false; labelMesh.frustumCulled = false;
   board.add(labelMesh);
   // headers on the slab rim: columns along the far edge, rows along the left edge
+  rowHdr = []; colHdr = [];
   for (let c = 1; c <= GRID; c++) {
     const h = makeText(String(c), { k: 0.6, color: '#ffffff', flat: true });
-    h.position.set(cellX(c), 0.945, cellZ(1) - 0.075); board.add(h);
+    h.position.set(cellX(c), 0.945, cellZ(1) - 0.075); board.add(h); colHdr[c] = h;
   }
   for (let r = 1; r <= GRID; r++) {
     const h = makeText(String(r), { k: 0.6, color: '#ffffff', flat: true });
-    h.position.set(-0.575, 0.945, cellZ(r)); board.add(h);
+    h.position.set(-0.575, 0.945, cellZ(r)); board.add(h); rowHdr[r] = h;
   }
   // roll highlight bars (section 4.1) and the flash used when the roll lands
   const barMat = own(new THREE.MeshBasicMaterial({ color: 0xffffff }));
@@ -496,18 +506,36 @@ function abortRoll() {
   if (flash) flash.visible = false;
   vrRolling = false; rollKey = null;
 }
+// Rise (section 3): the target cell grows from its height to sy 6 over 300 ms. scaleLock keeps syncScene from snapping it.
+function startRise(key) {
+  const cell = cellMesh[key], from = cell.scale.y;
+  riseKey = key; scaleLock.add(key);
+  riseCancel = animate(300, p => { cell.scale.y = from + (6 - from) * ease(p); }, endRise);
+}
+function endRise() {                                   // landed, or the target went away / the round changed
+  if (riseCancel) riseCancel();
+  riseCancel = null;
+  if (riseKey != null) scaleLock.delete(riseKey);
+  riseKey = null;
+}
 
 function syncScene(S) {
   if (!board || !S) return;
   paintHeroColours();
   if (vrRolling && S.n !== vrShownN) abortRoll();     // a newer round or a reset arrived mid-roll
-  if (S.n === 0) vrShownN = 0;                        // new match: its round 1 must replay even if the old one ended at round 1
+  if (S.n === 0) { vrShownN = 0; vrRiseN = 0; }       // new match: its round 1 must replay even if the old one ended at round 1
   if (S.roll && S.n !== vrShownN) { vrShownN = S.n; startRoll(S.roll); }   // may clear vrRolling (reduced motion)
   const hold = vrRolling ? rollKey : null;            // the roll tween owns this cell until it lands
   const targetKey = S.roll && S.phase === 'answer' ? S.roll.r + '-' + S.roll.c : null;
   const creeper = !!(S.creeper && S.creeper.n === S.n && S.phase === 'answer');
   const ore = S.ore || [], oreFound = S.oreFound || [], craters = S.craters || {};
   const showTarget = !!targetKey && !hold;
+  // rise (section 3): once per round, on the first sync where the target shows (after the roll replay has landed)
+  if (riseKey && (!showTarget || riseKey !== targetKey)) endRise();
+  if (showTarget && S.n !== vrRiseN) {
+    vrRiseN = S.n;
+    if (!matchMedia('(prefers-reduced-motion: reduce)').matches) startRise(targetKey);
+  }
 
   for (let r = 1; r <= GRID; r++) for (let c = 1; c <= GRID; c++) {
     const k = r + '-' + c;
@@ -540,6 +568,11 @@ function syncScene(S) {
     card.position.set(cellX(c), 0, cellZ(r));
     card.visible = true;
   } else card.visible = false;
+  const [tr, tc] = showTarget ? targetKey.split('-').map(Number) : [-1, -1];   // lit headers: target's row and column
+  for (let i = 1; i <= GRID; i++) {
+    rowHdr[i].setColor(i === tr ? '#ffd800' : '#ffffff');
+    colHdr[i].setColor(i === tc ? '#ffd800' : '#ffffff');
+  }
 
   updateHp(S);
 
@@ -1112,6 +1145,7 @@ function teardown() {
   matFree = matCrater = matTarget = matCreeper = matGem = null; matP = [];
   rowBar = colBar = flash = glowTex = null;
   card = cardGrp = cardText = post = null; cardBase = '';
+  rowHdr = colHdr = null; riseKey = null; riseCancel = null;
   panel = roomLabel = pad = padDisplay = fightTile = againTile = dash = null;
   cellBuckets.clear(); cellsDirty = true; labelMesh = labelAttr = atlas = null;
   lift = seatTile = exitTile = null; seated = false;
@@ -1120,7 +1154,7 @@ function teardown() {
   poseTgt = null; poseAt = 0; presenceAcc = 0; faceText = ''; faceTilt = [0, 0];
   msgEl = codeBoxEl = codeEl = null;
   panelText = roomText = null; lastP = ['', ''];
-  typed = ''; typedN = -1; vrShownN = 0; vrRolling = false; rollKey = null;
+  typed = ''; typedN = -1; vrShownN = 0; vrRiseN = 0; vrRolling = false; rollKey = null;
   unsubState = null; sessionEnded = false; desk = false;
   if (window.__vr) window.__vr = null;
   Z = null;
@@ -1159,6 +1193,7 @@ export async function start(Z_, opts = {}) {
 
     build();
     vrShownN = Z.state ? Z.state.n : 0;                 // do not replay a roll that is already on the board
+    vrRiseN = vrShownN;                                 // nor the target rise of the round already on screen
     fxSeed(Z.state);                                    // nor a claim, 67, boom, glitch, whistle, win or achievement already on the board
     updaters.add(mirrorPanel);
     updaters.add(spinGems);
