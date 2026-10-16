@@ -5,6 +5,8 @@ import * as THREE from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/
 
 // ---------- constants ----------
 const MM = 0.001;                                   // 1 canvas px = 1 mm
+const SS = 3;                                       // text supersampling factor
+let maxAniso = 1;                                   // set from the renderer in start()
 const FONT_LABEL = '48px "VT323", monospace';
 const FONT_TILE = '40px "VT323", monospace';
 const FONT_PANEL = '76px "VT323", monospace';
@@ -75,23 +77,30 @@ function textTexture(text, o) {
   ctx.font = o.font;
   const lines = wrapLines(ctx, text, o.maxW);
   let w = 1; for (const l of lines) w = Math.max(w, ctx.measureText(l).width);
-  cv.width = Math.ceil(w) + o.pad * 2;
-  cv.height = lines.length * o.lh + o.pad * 2;
+  const lw = Math.ceil(w) + o.pad * 2, lh = lines.length * o.lh + o.pad * 2;   // logical size (1 px = 1 mm)
+  cv.width = lw * SS; cv.height = lh * SS;                                   // drawn at SS x for crisp text in the headset
+  ctx.scale(SS, SS);
   ctx.font = o.font; ctx.textBaseline = 'top'; ctx.textAlign = 'center'; ctx.fillStyle = o.color;
-  lines.forEach((l, i) => ctx.fillText(l, cv.width / 2, o.pad + i * o.lh));
+  lines.forEach((l, i) => ctx.fillText(l, lw / 2, o.pad + i * o.lh));
   tex = new THREE.CanvasTexture(cv);
-  tex.generateMipmaps = false; tex.minFilter = THREE.LinearFilter;
-  tex.userData.w = cv.width; tex.userData.h = cv.height;
+  tex.generateMipmaps = true; tex.minFilter = THREE.LinearMipmapLinearFilter; tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = maxAniso; tex.colorSpace = THREE.SRGBColorSpace;
+  tex.userData.w = lw; tex.userData.h = lh;
   textCache.set(key, tex);
   if (textCache.size > 240) { const [k0, t0] = textCache.entries().next().value; textCache.delete(k0); t0.dispose(); }
   return tex;
 }
-// makeText(text, opts) -> Sprite with setText(t). 1 px = 1 mm times opts.k. opts.box [w, h] in metres shrinks oversize text.
+// makeText(text, opts) -> flat text quad (a Mesh, NOT a billboard) with setText(t). 1 px = 1 mm times opts.k.
+// The quad faces +z in its parent's frame, so a label parented to a tile stays glued to that tile at every viewing angle;
+// opts.flat lays it on the ground plane (reads from +y), opts.box [w, h] in metres shrinks oversize text.
+const textGeo = new THREE.PlaneGeometry(1, 1);
 function makeText(text, opts = {}) {
-  const o = { font: FONT_LABEL, color: '#ffffff', pad: 8, maxW: 0, k: 1, box: null, lh: 0, ...opts };
+  const o = { font: FONT_LABEL, color: '#ffffff', pad: 8, maxW: 0, k: 1, box: null, lh: 0, flat: false, ...opts };
   o.lh = o.lh || Math.round(parseFloat(o.font) * 1.15);
-  const mat = new THREE.SpriteMaterial({ transparent: true, depthWrite: false });
-  const sp = new THREE.Sprite(mat);
+  const mat = new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4, alphaTest: 0.02 });
+  const sp = new THREE.Mesh(textGeo, mat);
+  sp.renderOrder = 2;
+  if (o.flat) sp.rotation.x = -Math.PI / 2;
   let cur = null;
   sp.setText = t => {
     t = String(t == null ? '' : t);
@@ -278,12 +287,12 @@ function build() {
   board.add(labelMesh);
   // headers on the slab rim: columns along the far edge, rows along the left edge
   for (let c = 1; c <= GRID; c++) {
-    const h = makeText(String(c), { k: 0.5, color: '#ffffff' });
-    h.position.set(cellX(c), 0.96, cellZ(1) - 0.075); board.add(h);
+    const h = makeText(String(c), { k: 0.6, color: '#ffffff', flat: true });
+    h.position.set(cellX(c), 0.945, cellZ(1) - 0.075); board.add(h);
   }
   for (let r = 1; r <= GRID; r++) {
-    const h = makeText(String(r), { k: 0.5, color: '#ffffff' });
-    h.position.set(-0.575, 0.96, cellZ(r)); board.add(h);
+    const h = makeText(String(r), { k: 0.6, color: '#ffffff', flat: true });
+    h.position.set(-0.575, 0.945, cellZ(r)); board.add(h);
   }
   // roll highlight bars (section 4.1) and the flash used when the roll lands
   const barMat = own(new THREE.MeshBasicMaterial({ color: 0xffffff }));
@@ -312,7 +321,7 @@ function build() {
   const trackMat = own(new THREE.MeshBasicMaterial({ color: 0xc00000 })), fillMat = own(new THREE.MeshBasicMaterial({ color: 0xffd800 }));
   hpBars = [0, 1].map(s => {
     const g = new THREE.Group(); g.position.set(s === 0 ? -1.2 : 1.2, 1.9, -2.0); scene.add(g);
-    const name = makeText('', { k: 0.9 }); name.position.set(0, 0.12, 0); g.add(name);
+    const name = makeText('', { k: 1.6 }); name.position.set(0, 0.14, 0); g.add(name);
     const track = new THREE.Mesh(unitGeo, trackMat); track.scale.set(0.8, 0.08, 1); g.add(track);
     const fill = new THREE.Mesh(unitGeo, fillMat); fill.scale.set(0, 0.08, 1); fill.position.z = 0.002; g.add(fill);
     return { name, fill };
@@ -1097,6 +1106,7 @@ export async function start(Z_, opts = {}) {
     GRID = Z.N || 10; GOAL = Z.GOAL || 10;
 
     renderer = new THREE.WebGLRenderer({ antialias: true });
+    maxAniso = renderer.capabilities.getMaxAnisotropy();
     renderer.xr.enabled = true;
     renderer.setPixelRatio(1);
     canvas = renderer.domElement;
