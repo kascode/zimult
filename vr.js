@@ -23,7 +23,7 @@ let Z = null, desk = false, GRID = 10, GOAL = 10;
 let renderer = null, scene = null, camera = null, session = null, canvas = null;
 let board = null;                                   // pedestal + slab + cells + labels + roll bars: lowered or shaken as one
 const cellMesh = {}, gemFor = {};                   // 'r-c' -> CellProxy (cell, drawn instanced) / Mesh (ore gem)
-const SEAT_KEY = 'ttd-vr-seated', SEAT_DROP = 0.35;  // section 9: seated mode lowers the board, numpad and tiles by this much
+const SEAT_KEY = 'ttd-vr-seated', SEAT_DROP = 0.30, SEAT_BACK = 0.30;  // seated: lower the board and console and push them away, so they do not loom at a seated eye height
 let seated = false, lift = null, seatTile = null, exitTile = null;
 let tileGeo = null, edgeGeo = null, cellGeo = null, gemGeo = null, lineMat = null;
 let roundGeo = null, ringMat = null, rollDepress = null;   // round tiles (section 2); rollDepress = cancel of the ROLL press tween
@@ -1156,7 +1156,7 @@ function readSeated() { try { return localStorage.getItem(SEAT_KEY) === '1'; } c
 function writeSeated(on) { try { localStorage.setItem(SEAT_KEY, on ? '1' : '0'); } catch (_) {} }
 function applySeated(on) {
   seated = on;
-  lift.position.y = on ? -SEAT_DROP : 0;
+  lift.position.set(0, on ? -SEAT_DROP : 0, on ? -SEAT_BACK : 0);
   if (seatTile) seatTile.label.setText(on ? 'STAND' : 'SIT');
 }
 function toggleSeated() { applySeated(!seated); writeSeated(seated); }
