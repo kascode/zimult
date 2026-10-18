@@ -813,7 +813,8 @@ async function render() {
       const submit = () => { if (inp.value === '') return; inp.disabled = true; dispatch({type:'answer', slot, value: inp.value}); };
       inp.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } };
       q.append(inp, btn('Answer', submit));
-      actEl.appendChild(q); inp.focus();
+      actEl.appendChild(q);
+      if (!document.documentElement.dataset.vr) inp.focus();   // in VR the console numpad answers; focusing would pop the headset keyboard
     } else setMsg(pre + name(slot) + ' is answering ' + r + ' × ' + c + '…');
     return;
   }

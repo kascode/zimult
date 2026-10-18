@@ -1205,6 +1205,7 @@ function teardown() {
   typed = ''; typedN = -1; vrShownN = 0; vrRiseN = 0; vrRolling = false; rollKey = null;
   unsubState = null; sessionEnded = false; desk = false;
   if (window.__vr) window.__vr = null;
+  delete document.documentElement.dataset.vr;
   Z = null;
   active = false; tearingDown = false;
 }
@@ -1214,6 +1215,7 @@ function teardown() {
 export async function start(Z_, opts = {}) {
   if (active) { if (opts.session) opts.session.end().catch(() => {}); return; }
   active = true; Z = Z_;
+  document.documentElement.dataset.vr = '1';           // the 2D view checks this to keep the system keyboard away
   const gen = runGen;
   desk = opts.desk != null ? !!opts.desk : location.hash === '#vrdesk';
   try {
